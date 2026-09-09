@@ -213,7 +213,7 @@ agent (browser_* 工具)
 - **provider 层**(`browser-electron` 行)通过 `ElectronBrowserViewHost` 接缝操作视图(创建/销毁/显示/`sendCommand`),由真实外壳用 Electron 对象实现;
 - **工具层**(`tool-browser` 行)提供模型侧的 33 个 `browser_*` 工具,按调用方任务(DSH 会话)维护独立的浏览器会话。
 
-**自托管模式**:没有桌面外壳时,插件自己拉起一个 Electron 子进程(`host-main.js`),通过本机 TCP JSON-RPC 驱动。RPC 带随机 token 认证,token 经 **stdin + 环境变量双通道**传递——Windows 上 Electron 是 GUI 子系统进程、收不到 piped stdin,环境变量兜底保证握手稳定。子进程崩溃会自动重启;优先使用随插件安装的 electron 包(**打包应用如 DSH Desktop.exe 不会被误当作可复用二进制**,避免 spawn 秒退);截图优先走 Electron 原生 `capturePage`(CDP 截图在多视图下会挂起),并自动选择环境中**最新版本**的 Electron(33.x 有合成器缺陷,建议 ≥ 40;44+ 首次使用自动下载二进制,需联网)。
+**自托管模式**:没有桌面外壳时,插件自己拉起一个 Electron 子进程(`host-main.js`),通过本机 TCP JSON-RPC 驱动。RPC 带随机 token 认证,token 经 **stdin + 环境变量双通道**传递——Windows 上 Electron 是 GUI 子系统进程、收不到 piped stdin,环境变量兜底保证握手稳定。子进程崩溃会自动重启;优先使用随插件安装的 electron 包(**打包应用如 DSH Desktop.exe 不会被误当作可复用二进制**,避免 spawn 秒退);截图优先走 Electron 原生 `capturePage`(CDP 截图在多视图下会挂起);Electron 的定位顺序见下(33.x 有合成器缺陷,建议 ≥ 40;44+ 的 electron 包不再随安装自动下载二进制,首次使用若缺失会按报错提示先 `npx install-electron`,需联网)。
 
 **自托管浏览器就是一台真正的浏览器**:每个任务(DSH 会话)拥有**独立的浏览器窗口**,窗口自带完整工具栏——地址栏、后退/前进/刷新按钮、标签条(新建/切换/关闭标签)。人可以直接像用 Chrome 一样使用它:在地址栏输入网址(自动补 `https://`)、点标签切换页面、开新标签;键盘焦点跟随点击——**点地址栏即可输入、点页面即可操作**(Windows 焦点路由,修复了点击不转移焦点导致地址栏无法输入的问题)。agent 与人的操作都汇入**同一个会话模型**(同一套标签、历史与导航),窗口标题实时显示当前任务标识与页面标题/URL,窗口缩放时视图自动跟随。任务结束后窗口随会话自动关闭。
 
@@ -226,7 +226,7 @@ agent (browser_* 工具)
 ## 环境要求
 
 - DeepSeek Harness(dsh),已安装对应 profile(`web` / `desktop` 等)
-- **Electron 运行时**(必装依赖,随插件自动安装,建议 ≥ 40;44+ 首次使用自动下载二进制,需网络):
+- **Electron 运行时**(必装依赖,随插件自动安装,建议 ≥ 40;44+ 的二进制不随安装自动下载,缺失时按报错提示先 `npx install-electron`,需网络):
   - `ELECTRON_PATH` 可显式指定其他二进制(最优先);
   - **DSH Desktop**:打包宿主 exe(`DSH Desktop.exe`)**不复用**——打包应用无法按脚本参数拉起,误用会秒退(issue #6);直接使用随包 electron,开发模式的**裸** Electron 宿主仍可复用;
   - **纯 `dsh web` 自托管**:直接使用随插件安装的 electron 包
@@ -253,10 +253,10 @@ agent (browser_* 工具)
 - `browser_download` 在页面上下文内 `fetch`(带登录态),受同源/CORS 约束;仅允许 HTTP(S) 目标;`savePath` 必须为绝对路径(默认限定在 `~/Downloads`,可用 `downloadDir` 覆盖);单文件上限 256MB(流式限流,按 Content-Length 提前拒绝),文件由浏览器子进程直接落盘(临时文件 + 原子改名)。
 - 自托管浏览器的 cookie 在磁盘上以明文存储(Electron 默认行为);需要加密落盘的部署应在宿主层接入系统钥匙串 / DPAPI。
 - `browser_restrict` 是防误操作的**软护栏**,不是安全边界:模型可以自行解除白名单。
-- 页面弹窗(`window.open` / `target=_blank`)会在同一会话窗口中**新开一个标签页**打开,保留原页面与 opener 上下文,跳转也计入会话历史;非 HTTP(S) 弹窗(OAuth 承接页、`mailto:`、自定义协议)仍交给系统处理,不创建未跟踪的独立窗口。
+- 页面弹窗(`window.open` / `target=_blank`)不再覆盖当前视图:HTTP(S) 弹窗会在同一会话窗口**新开一个标签页**并计入历史,原页面与 opener 上下文保留;非 HTTP(S) 弹窗(空 URL 弹窗承接、`mailto:`、自定义协议)仍**放行原生窗口**,交给系统处理——这类弹窗不纳入会话模型。
 - `browser_auth` 的 cookie 往返不保留 `hostOnly`/`sameSite` 字段(host-only cookie 恢复后变成 domain cookie);仅自托管浏览器可用。
 - 自托管浏览器子进程崩溃(或宿主 DSH 重启)后会自动重启;崩溃前已打开的会话在**下一次调用时自动重建**——仅页面状态丢失,无需手动 `browser_reset_session`。`browser_reset_session` 仍可用于主动重置。
-- electron 随插件安装;Electron 44+ 首次打开浏览器窗口时自动下载二进制(约 100MB,需网络),之后不再需要。若探测时网络不可用,可预装 `ELECTRON_PATH` 指定的二进制。
+- electron 随插件安装;但 Electron 44+ 不再随安装下载二进制(约 100MB,需网络)——插件探测是纯文件系统、不触发其懒下载,二进制缺失时首次使用会报错并提示先 `npx install-electron`;也可预装 `ELECTRON_PATH` 指定的二进制。
 - 本插件不含浏览器列 UI——那是宿主外壳的配套,别把"浏览器列"当成插件能力。
 
 ## 开发

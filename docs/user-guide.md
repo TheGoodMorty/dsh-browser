@@ -4,8 +4,8 @@
 
 - DeepSeek Harness(dsh),已安装对应 profile(`web` / `desktop` 等)
 - **Electron 运行时**(必装依赖,随插件自动安装):
-  - **DSH Desktop**:宿主本身基于 Electron,**插件自动复用宿主二进制**(随包安装的 electron 仅作后备);
-  - **纯 `dsh web` 自托管**:直接使用随插件安装的 electron 包(建议 ≥ 40,33.x 存在截图合成器缺陷;44+ 首次使用自动下载,需网络)。
+  - **DSH Desktop**:打包宿主 exe(`DSH Desktop.exe`)**不复用**——打包应用无法按脚本参数拉起,误用会秒退(issue #6);直接使用随包 electron,开发模式的**裸** Electron 宿主仍可复用;
+  - **纯 `dsh web` 自托管**:直接使用随插件安装的 electron 包(建议 ≥ 40,33.x 存在截图合成器缺陷;44+ 二进制首次缺失时按报错提示先 `npx install-electron`,需网络)。
 
 ## 安装
 
@@ -76,7 +76,7 @@ dsh plugin --profile web add <本仓库路径>
 **Q:找不到 Electron?**
 插件按顺序自动定位:① `ELECTRON_PATH` 环境变量(显式覆盖,优先于一切自动发现)→ ② 随插件安装的 electron 包(纯文件系统探测,不触发 44+ 懒下载)→ ③ DSH 锚点(profile / 全局 prefix 中单独安装的 electron)中版本最新者 → ④ 当前进程就是**裸** Electron(dev 模式)时复用宿主二进制 → ⑤ 进程祖先树中的裸 Electron 二进制。**打包应用不参与复用**:旁有 `resources/app.asar` 的可执行文件(如 DSH Desktop.exe)无法按脚本参数拉起,spawn 会启动应用本体并秒退(单实例锁)——一律跳过。
 
-DSH Desktop 上①命中即可用(0.1.18+ 插件自带 electron 包,44+ 二进制首次使用自动下载);dev 模式宿主走④复用,亦零安装。全部落空时,报错会给出指引:electron 已随插件安装,44+ 二进制缺失时先 `npx install-electron`(需网络);必要时可设置 `ELECTRON_PATH`。
+DSH Desktop 上②命中即可用(0.1.18+ 插件自带 electron 包;44+ 二进制缺失时先 `npx install-electron`,需网络);dev 模式宿主走④复用,亦零安装。全部落空时,报错会给出指引:electron 已随插件安装,44+ 二进制缺失时先 `npx install-electron`(需网络);必要时可设置 `ELECTRON_PATH`。
 
 **Q:截图失败或挂起?**
 确保 Electron ≥ 40(33.x 有合成器缺陷)。自托管截图优先走原生 `capturePage`,多视图/窗口未激活时自动兜底到 CDP。
@@ -94,7 +94,7 @@ DSH Desktop 上①命中即可用(0.1.18+ 插件自带 electron 包,44+ 二进�
 
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
-| `BROWSER_SESSION_UNKNOWN` | 子进程重启后旧会话失效 | `browser_reset_session` |
+| `BROWSER_SESSION_UNKNOWN` | 会话已被关闭/重建(如 `browser_reset_session` 后仍引用旧会话) | `browser_session` 查看现状;或 `browser_reset_session` 重建 |
 | 工具超时 | 页面卡死/未渲染完成 | 稍后重试;`browser_reset` 重置标签 |
 | 导航被拒 | 非 HTTP(S) 协议 | 检查 URL;`httpOnly` 配置 |
 | 快照为空 | 页面尚未加载 | 等待后重试 `browser_snapshot` |

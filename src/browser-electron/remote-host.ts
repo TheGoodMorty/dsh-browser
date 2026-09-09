@@ -355,23 +355,32 @@ function compareVersions(a: string, b: string): number {
   return 0
 }
 
-/** From an electron package entry file, find the dist executable beside it. */
-function electronExeBeside(entry: string): string | undefined {
-  const candidates = [
-    join(dirname(entry), 'dist', 'electron.exe'),
-    join(dirname(entry), 'dist', 'electron'),
-    join(dirname(entry), '..', 'dist', 'electron.exe'),
-    join(dirname(entry), '..', 'dist', 'electron'),
+/** Candidate executable layouts used by the Electron npm package on one platform. */
+function electronDistCandidates(pkgRoot: string, platform: NodeJS.Platform = process.platform): string[] {
+  // macOS keeps the runnable binary inside the Electron.app bundle; unlike
+  // Windows/Linux there is no dist/electron(.exe) sibling to probe.
+  if (platform === 'darwin') {
+    return [join(pkgRoot, 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron')]
+  }
+  return [
+    join(pkgRoot, 'dist', 'electron.exe'),
+    join(pkgRoot, 'dist', 'electron'),
   ]
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate
+}
+
+/** From an electron package entry file, find the dist executable beside it. */
+function electronExeBeside(entry: string, platform: NodeJS.Platform = process.platform): string | undefined {
+  const packageRoots = [dirname(entry), join(dirname(entry), '..')]
+  for (const packageRoot of packageRoots) {
+    const candidate = electronDistExe(packageRoot, platform)
+    if (candidate !== undefined) return candidate
   }
   return undefined
 }
 
 /** From an electron package root, find its dist executable. */
-function electronDistExe(pkgRoot: string): string | undefined {
-  for (const candidate of [join(pkgRoot, 'dist', 'electron.exe'), join(pkgRoot, 'dist', 'electron')]) {
+function electronDistExe(pkgRoot: string, platform: NodeJS.Platform = process.platform): string | undefined {
+  for (const candidate of electronDistCandidates(pkgRoot, platform)) {
     if (existsSync(candidate)) return candidate
   }
   return undefined
@@ -1001,6 +1010,9 @@ export function defaultHostMainPath(): string {
  * steps; `resolveElectronPath` is the full resolution order.
  */
 export const internals = {
+  electronDistCandidates,
+  electronDistExe,
+  electronExeBeside,
   isBareElectron,
   resolveElectronPath,
   resolveElectronPathImpl,

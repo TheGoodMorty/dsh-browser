@@ -49,6 +49,33 @@ test('isBareElectron: packaged apps are never spawnable as bare electron', () =>
   }
 })
 
+test('electron package resolution recognizes the macOS Electron.app layout', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-browser-darwin-'))
+  try {
+    const macExe = join(dir, 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron')
+    mkdirSync(join(dir, 'dist', 'Electron.app', 'Contents', 'MacOS'), { recursive: true })
+    writeFileSync(macExe, 'x')
+
+    // Electron's macOS npm package stores its runnable binary only inside
+    // Electron.app; there is no dist/electron sibling to discover.
+    assert.deepEqual(internals.electronDistCandidates(dir, 'darwin'), [macExe])
+    assert.equal(internals.electronDistExe(dir, 'darwin'), macExe)
+    assert.equal(internals.electronExeBeside(join(dir, 'index.js'), 'darwin'), macExe)
+
+    // Keep the existing non-macOS layouts unchanged.
+    assert.deepEqual(internals.electronDistCandidates(dir, 'linux'), [
+      join(dir, 'dist', 'electron.exe'),
+      join(dir, 'dist', 'electron'),
+    ])
+    assert.equal(internals.electronDistExe(dir, 'linux'), undefined)
+    const linuxExe = join(dir, 'dist', 'electron')
+    writeFileSync(linuxExe, 'x')
+    assert.equal(internals.electronDistExe(dir, 'linux'), linuxExe)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('resolveElectronPath order: override > bundled > anchors > bare host > ancestry, packaged host skipped', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-browser-resolve-'))
   try {

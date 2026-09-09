@@ -83,6 +83,12 @@ declare function resolveElectronPathImpl(inputs: ElectronPathInputs): string;
  * resources dir at all) likewise cannot run a script argument.
  */
 declare function isBareElectron(exe: string): boolean;
+/** Candidate executable layouts used by the Electron npm package on one platform. */
+declare function electronDistCandidates(pkgRoot: string, platform?: NodeJS.Platform): string[];
+/** From an electron package entry file, find the dist executable beside it. */
+declare function electronExeBeside(entry: string, platform?: NodeJS.Platform): string | undefined;
+/** From an electron package root, find its dist executable. */
+declare function electronDistExe(pkgRoot: string, platform?: NodeJS.Platform): string | undefined;
 /**
  * Self-hosted view host: spawns the plugin's Electron child on first use and
  * keeps it alive until dispose(). Fallback when no desktop shell provides
@@ -144,6 +150,9 @@ export declare function defaultHostMainPath(): string;
  * steps; `resolveElectronPath` is the full resolution order.
  */
 export declare const internals: {
+    electronDistCandidates: typeof electronDistCandidates;
+    electronDistExe: typeof electronDistExe;
+    electronExeBeside: typeof electronExeBeside;
     isBareElectron: typeof isBareElectron;
     resolveElectronPath: typeof resolveElectronPath;
     resolveElectronPathImpl: typeof resolveElectronPathImpl;
