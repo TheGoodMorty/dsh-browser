@@ -150,7 +150,7 @@ See the full list in [Tool reference](#tool-reference).
 | `browser_clear` | Clear an input/textarea/contenteditable, or uncheck (`target`-located) | ✅ |
 | `browser_get_value` | Read an element's current value for verification (`target`-located) | – |
 | `browser_scrape` | Structured extraction: container selector + field map (`selector@attr`), static CSS only, CSP-safe | – |
-| `browser_screenshot` | Capture, optional `fullPage`, `savePath`, JPEG (`format`/`quality`) and scaling (`maxWidth`/`maxHeight`) | – |
+| `browser_screenshot` | Capture, optional `fullPage`, `savePath`, JPEG (`format`/`quality`) and scaling (`maxWidth`/`maxHeight`); `savePath` shares the download gate (confined to `downloadDir`, never overwrites) | – |
 | `browser_list_tabs` | List the session's tabs | – |
 | `browser_switch_tab` | Switch to a tab by id (also switches the visible view when self-hosted) | ✅ |
 | `browser_close_tab` | Close a tab by id; closing the active tab activates the next | – |
@@ -159,7 +159,7 @@ See the full list in [Tool reference](#tool-reference).
 | `browser_reset_session` | Close and rebuild this task's browser session | ✅ |
 | `browser_history` | Operation log (newest last), with per-step success/error and result summary | – |
 | `browser_replay` | Replay one step by sequence number (navigate/execute/click/type) | ✅ |
-| `browser_download` | Download an HTTP(S) URL with session cookies to a local file (absolute `savePath`, 256 MB cap) | ✅ |
+| `browser_download` | Download an HTTP(S) URL with session cookies to a local file (absolute `savePath` inside `downloadDir`, never overwrites, 256 MB cap) | ✅ |
 | `browser_auth` | Export/restore cookies (login persistence, self-hosted) | ✅ |
 | `browser_challenge` | Detect a human-verification challenge (CAPTCHA / Cloudflare / reCAPTCHA / hCaptcha / Turnstile) | – |
 | `browser_restrict` | Restrict allowed browser actions (allow-list; empty list lifts it). **Soft guardrail** — the model can lift it itself; not a security boundary | – |
@@ -195,7 +195,7 @@ The plugin mounts through `cordis.patch.yml` (three rows); per-row config:
 | `browser-electron` | `httpOnly` | boolean | `true` | Allow HTTP(S) navigation only; other protocols (e.g. `file:`/`data:`) rejected (`BROWSER_NAVIGATION_BLOCKED`) |
 | `browser-electron` | `snapshotMaxElements` | number | `60` | Max snapshot elements before truncation |
 | `browser-electron` | `contentMaxChars` | number | `100000` | Default content character cap |
-| `browser-electron` | `downloadDir` | string | `~/Downloads` | Confine `browser_download` save paths to this directory (stops a prompt-injected agent writing arbitrary paths); defaults to the OS Downloads folder, override for a sandbox dir |
+| `browser-electron` | `downloadDir` | string | system Downloads folder (`Downloads`/`下载`/`下載`, or `XDG_DOWNLOAD_DIR`, auto-detected) | Confine `browser_download` AND `browser_screenshot` save paths to this directory, never overwriting an existing file (stops a prompt-injected agent writing or replacing arbitrary paths); override for a sandbox dir |
 | `tool-browser` | `timeoutMs` | number | `60000` | Cooperative tool timeout (ms) |
 | `tool-browser` | `tabTools` | boolean | `true` | Register tab-management tools (`browser_list_tabs` etc.) |
 
@@ -250,7 +250,7 @@ The browser's **visible view**, the **browser column layout**, and the **column-
 - `fullPage` capture is flaky under software compositing on some hosts.
 - CAPTCHA cannot be solved automatically: snapshots flag detected challenges; ask the human to complete it in the shared window instead of retrying.
 - Private mode (`privateMode`) is not implemented: it needs Electron session partitioning, which is host-layer territory; this plugin does not promise it.
-- `browser_download` fetches in the page context (keeps logins) and is subject to same-origin/CORS constraints; HTTP(S) targets only; `savePath` must be absolute (default confined to `~/Downloads`, override with `downloadDir`); single files are capped at 256 MB (streamed with a Content-Length early reject) and are written by the browser child itself (temp file + atomic rename).
+- `browser_download` fetches in the page context (keeps logins) and is subject to same-origin/CORS constraints; HTTP(S) targets only; `savePath` must be absolute and inside `downloadDir` (default: the system Downloads folder, auto-detecting `Downloads`/`下载`/`下載` and `XDG_DOWNLOAD_DIR`; override with `downloadDir`) and never replaces an existing file; `browser_screenshot`'s `savePath` goes through the same gate; single files are capped at 256 MB (streamed with a Content-Length early reject) and are written by the browser child itself (temp file + atomic rename).
 - The self-hosted browser's cookies are stored in plaintext on disk (Electron default); deployments that need encrypted-at-rest should integrate a system keychain / DPAPI at the host layer.
 - `browser_restrict` is a **soft guardrail** against accidental actions, not a security boundary: the model can lift it itself.
 - Popups (`window.open` / `target=_blank`) no longer overwrite the current view: HTTP(S) popups open as a **new tab** in the same session window, recorded in the session history, keeping the original page and its opener context alive. Non-HTTP(S) popups (empty-URL popup handoffs, `mailto:`, custom schemes) are still **allowed as native windows** and handed to the system — such windows are simply not part of the session model.

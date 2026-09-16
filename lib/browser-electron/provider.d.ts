@@ -372,13 +372,29 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
      */
     scrape(session: BrowserSessionId, request: BrowserScrapeRequest, signal?: AbortSignal): Promise<BrowserScrapeResult>;
     /**
-     * Download a URL to a local file, keeping the session's cookies/login.
-     * Requires the self-hosted host (which implements view-level download); the
-     * desktop shell's embedded views delegate downloads to the real browser UI.
-     * Admission: only HTTP(S) targets (the in-page fetch cannot meaningfully
-     * fetch anything else), and the save path must be absolute — confined to
-     * `downloadDir` when one is configured, so a prompt-injected agent cannot
-     * write arbitrary machine paths.
+     * Admit a caller-supplied save path for a file the browser writes to disk.
+     * ONE gate for both `browser_download` and `browser_screenshot`: the path
+     * must be absolute, must resolve inside `downloadDir`, and must not already
+     * exist. Without it a prompt-injected agent could write — or silently
+     * replace — any file the DSH process can reach, which also escapes the file
+     * sandbox every other tool in the set runs under.
+     * @param savePath - the caller's target path.
+     * @param kind - the operation, used in the error code and message.
+     * @returns the resolved absolute target path.
+     * @throws BrowserError when the path is relative, outside the directory, or occupied.
+     */
+    private admitSavePath;
+    /**
+     * Download an HTTP(S) URL with the session's cookies to a local file.
+     * Admission is the shared {@link admitSavePath} gate; only the self-hosted
+     * host implements it (the desktop shell's embedded views delegate downloads
+     * to the real browser UI). Both admitted paths and screenshots are confined
+     * to `downloadDir`, so a prompt-injected agent cannot write arbitrary
+     * machine paths.
+     * @param session - the session whose cookies are used.
+     * @param request - the URL plus the absolute target path.
+     * @param signal - optional cancellation.
+     * @returns the path the file was written to.
      */
     download(session: BrowserSessionId, request: {
         readonly url: string;
@@ -398,7 +414,13 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
         readonly dataUrl: string;
         readonly path?: string;
     }>;
-    /** Build the data URL and optionally write the image to disk. */
+    /**
+     * Build the data URL and optionally write the image to disk. The caller's
+     * path goes through the SAME {@link admitSavePath} gate as a download — it
+     * must be absolute, resolve inside `downloadDir`, and not be an existing
+     * file — so a screenshot cannot be used to write to, or silently replace,
+     * files anywhere the DSH process happens to have permission (issue #13).
+     */
     private saveScreenshot;
     /** Append one operation to the session's history. */
     private record;

@@ -50,7 +50,7 @@
 | --- | --- | --- | --- | --- |
 | `browser_history` | – | `{ entries[] }` | – | 操作日志(最新在后),含 seq/action/ok/params/result/error |
 | `browser_replay` | `seq`(必填) | `{ replayed }` | ✅ | 按序号回放某一步(navigate/execute/click/type/scroll/key) |
-| `browser_download` | `url`(必填), `savePath`(必填) | `{ path }` | ✅ | 带会话 cookie 下载到本地(仅 http(s);`savePath` 必须为绝对路径,默认限定在 `~/Downloads`,可用 `downloadDir` 覆盖;上限 256MB,受 CORS 约束;由子进程直接落盘) |
+| `browser_download` | `url`(必填), `savePath`(必填) | `{ path }` | ✅ | 带会话 cookie 下载到本地(仅 http(s);`savePath` 必须为绝对路径且位于 `downloadDir` 内——默认系统下载目录,自动识别 `Downloads`/`下载`/`下載` 与 `XDG_DOWNLOAD_DIR`;不覆盖已有文件;上限 256MB,受 CORS 约束;由子进程直接落盘) |
 
 ## 登录态与安全
 
@@ -63,7 +63,7 @@
 
 | 工具 | 参数 | 输出 | 守卫 | 说明 |
 | --- | --- | --- | --- | --- |
-| `browser_screenshot` | `fullPage?`, `savePath?`, `format?`(png/jpeg), `quality?`, `maxWidth?`, `maxHeight?` | `{ dataUrl, path? }` | – | 截图;PNG 默认,JPEG 仅自托管原生路径;`maxWidth`/`maxHeight` 等比缩放降低视觉模型开销;`savePath` 落盘供视觉模型读取 |
+| `browser_screenshot` | `fullPage?`, `savePath?`, `format?`(png/jpeg), `quality?`, `maxWidth?`, `maxHeight?` | `{ dataUrl, path? }` | – | 截图;PNG 默认,JPEG 仅自托管原生路径;`maxWidth`/`maxHeight` 等比缩放降低视觉模型开销;`savePath` 落盘供视觉模型读取(与 `browser_download` 同一准入门:必须位于 `downloadDir` 内且不覆盖已有文件) |
 
 ## 常用组合
 

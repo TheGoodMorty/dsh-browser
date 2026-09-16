@@ -35,7 +35,7 @@ dsh plugin --profile web add <本仓库路径>
 | `browser-electron` | `httpOnly` | 布尔 | `true` | 仅允许 HTTP(S) 导航;`file:`/`data:` 等拒绝 |
 | `browser-electron` | `snapshotMaxElements` | 数字 | `60` | 快照最多收录的交互元素数 |
 | `browser-electron` | `contentMaxChars` | 数字 | `100000` | 内容抓取默认字符上限 |
-| `browser-electron` | `downloadDir` | 字符串 | `~/Downloads` | 限定 `browser_download` 保存路径必须位于该目录内;默认收敛到系统下载目录,可改沙箱目录 |
+| `browser-electron` | `downloadDir` | 字符串 | 系统下载目录(自动识别 `Downloads`/`下载`/`下載`,或 `XDG_DOWNLOAD_DIR`) | 限定 `browser_download` 与 `browser_screenshot` 保存路径必须位于该目录内且不覆盖已有文件;默认收敛到系统下载目录,可改沙箱目录 |
 | `tool-browser` | `timeoutMs` | 数字 | `60000` | 工具协作超时(ms) |
 | `tool-browser` | `tabTools` | 布尔 | `true` | 是否注册标签管理工具 |
 
@@ -85,7 +85,7 @@ DSH Desktop 上②命中即可用(0.1.18+ 插件自带 electron 包;44+ 二进�
 窗口标题为 `dsh-browser`(自托管)。若子进程崩溃(或宿主 DSH 重启)会自动重启;崩溃前已打开的会话在**下一次调用时自动重建**——仅页面状态丢失,无需手动 `browser_reset_session`。`browser_reset_session` 仍可用于主动重置。
 
 **Q:下载报 CORS 错误?**
-`browser_download` 在页面上下文内 `fetch`,受同源/CORS 约束;跨域文件请先在同源页面内操作,或直接请求用户提供。仅支持 HTTP(S) URL;`savePath` 必须为绝对路径(配置 `downloadDir` 后限定在该目录内)。
+`browser_download` 在页面上下文内 `fetch`,受同源/CORS 约束;跨域文件请先在同源页面内操作,或直接请求用户提供。仅支持 HTTP(S) URL;`savePath` 必须为绝对路径且位于 `downloadDir` 内(默认系统下载目录,自动识别 `Downloads`/`下载`/`下載`),不覆盖已有文件;`browser_screenshot` 的 `savePath` 受同一套限制。
 
 **Q:如何禁止 agent 乱点?**
 `browser_restrict` 设置白名单(如只允许 `browser_snapshot`/`browser_content`);传空列表解除。注意它是防误操作的**软护栏**,模型可自行解除,不是安全边界。

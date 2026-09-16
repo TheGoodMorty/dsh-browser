@@ -1087,7 +1087,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     description: 'Capture the current shared-browser page as a screenshot (PNG default, JPEG optional). Use for visual confirmation of layout, charts, designs, or CAPTCHAs, or to feed a vision tool (read_image) that locates elements visually. Supports full-page capture, save-to-file, JPEG encoding, and downscaling (maxWidth/maxHeight) to cut vision-tool token cost. JPEG is only available on the self-hosted native path; the desktop-shell path returns PNG.',
     parameters: {
       fullPage: { type: 'boolean', description: 'Capture the full scrollable page instead of the viewport (default false).' },
-      savePath: { type: 'string', description: 'Absolute file path to also save the image to (e.g. for read_image vision location).' },
+      savePath: { type: 'string', description: 'Absolute file path to also save the image to (e.g. for read_image vision location). Must resolve inside the configured downloadDir (default: the system Downloads folder, localized names such as ~/下载 included); an existing file is never overwritten.' },
       format: { type: 'string', enum: ['png', 'jpeg'], description: 'Image format (default png; jpeg is self-hosted native path only).' },
       quality: { type: 'number', description: 'JPEG quality 1-100 (default 80); ignored for PNG.' },
       maxWidth: { type: 'number', description: 'Downscale to fit within this width (aspect preserved).' },
@@ -1354,7 +1354,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     description: 'Download a URL to a local file, keeping the browser session\'s cookies and login state. Use for fetching files behind authentication or from the current page context. Available on the self-hosted browser; the desktop shell delegates downloads to the real browser UI.',
     parameters: {
       url: { type: 'string', required: true, description: 'The URL to download.' },
-      savePath: { type: 'string', required: true, description: 'Absolute path of the file to write.' },
+      savePath: { type: 'string', required: true, description: 'Absolute path of the file to write. Must resolve inside the configured downloadDir (default: the system Downloads folder, localized names such as ~/下载 included); an existing file is never overwritten.' },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { path: { type: 'string', required: true } } },

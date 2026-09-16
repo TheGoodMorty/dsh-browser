@@ -8,9 +8,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import type {
   BrowserA11yRequest,
   BrowserA11yResult,
@@ -318,6 +318,31 @@ const KEY_SPECS: Readonly<Record<string, { readonly key: string; readonly code: 
 export const BROWSER_KEY_NAMES: readonly string[] = Object.keys(KEY_SPECS)
 
 /**
+ * Localized names a system Downloads folder may carry, in probe order: the
+ * English default first, then the Chinese spellings — a zh-CN desktop calls
+ * the folder `下载`, a zh-TW one `下載`, and neither is `Downloads`.
+ */
+const DOWNLOAD_DIR_NAMES: readonly string[] = ['Downloads', '下载', '下載']
+
+/**
+ * Resolve the default download directory when the config names none: an
+ * existing `XDG_DOWNLOAD_DIR` wins (the freedesktop standard, which is what a
+ * localized Linux desktop writes), then the first localized `Downloads` folder
+ * that exists under the home directory, and finally the English name — created
+ * on first use — when none exists yet.
+ * @returns the absolute default download directory.
+ */
+function defaultDownloadDir(): string {
+  const xdg = process.env.XDG_DOWNLOAD_DIR
+  if (typeof xdg === 'string' && xdg !== '' && existsSync(xdg)) return xdg
+  for (const name of DOWNLOAD_DIR_NAMES) {
+    const candidate = join(homedir(), name)
+    if (existsSync(candidate)) return candidate
+  }
+  return join(homedir(), DOWNLOAD_DIR_NAMES[0] ?? 'Downloads')
+}
+
+/**
  * Browser provider over Electron views. Sessions hold an ordered list of
  * tabs; each tab is one view created by the host. The active tab receives
  * every operation; switching tabs calls the host's optional `showView` and
@@ -340,9 +365,12 @@ export class ElectronBrowserProvider implements BrowserProvider {
     this.httpOnly = config.httpOnly ?? true
     this.snapshotMaxElements = config.snapshotMaxElements ?? 60
     this.contentMaxChars = config.contentMaxChars ?? 100_000
-    // Confine downloads to a dedicated directory by default: the OS Downloads
-    // folder is the human-visible, browser-natural place for downloaded files.
-    this.downloadDir = config.downloadDir ?? join(homedir(), 'Downloads')
+    // Confine downloads AND screenshot saves to a dedicated directory by
+    // default: the OS Downloads folder is the human-visible, browser-natural
+    // place for written files, and it is the one directory the DSH file
+    // sandbox does not have to arbitrate. The localized name is probed so a
+    // Chinese desktop (`~/下载`) works without configuring `downloadDir`.
+    this.downloadDir = config.downloadDir ?? defaultDownloadDir()
     // Route toolbar (host UI) actions into the session model: the human and
     // the agent then always drive the same tabs, history, and navigation.
     this.host.onUserAction?.(action => { void this.handleUserAction(action) })
@@ -1825,13 +1853,54 @@ export class ElectronBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * Download a URL to a local file, keeping the session's cookies/login.
-   * Requires the self-hosted host (which implements view-level download); the
-   * desktop shell's embedded views delegate downloads to the real browser UI.
-   * Admission: only HTTP(S) targets (the in-page fetch cannot meaningfully
-   * fetch anything else), and the save path must be absolute — confined to
-   * `downloadDir` when one is configured, so a prompt-injected agent cannot
-   * write arbitrary machine paths.
+   * Admit a caller-supplied save path for a file the browser writes to disk.
+   * ONE gate for both `browser_download` and `browser_screenshot`: the path
+   * must be absolute, must resolve inside `downloadDir`, and must not already
+   * exist. Without it a prompt-injected agent could write — or silently
+   * replace — any file the DSH process can reach, which also escapes the file
+   * sandbox every other tool in the set runs under.
+   * @param savePath - the caller's target path.
+   * @param kind - the operation, used in the error code and message.
+   * @returns the resolved absolute target path.
+   * @throws BrowserError when the path is relative, outside the directory, or occupied.
+   */
+  private admitSavePath(savePath: string, kind: 'download' | 'screenshot'): string {
+    const code = kind === 'download' ? 'BROWSER_DOWNLOAD_BLOCKED' : 'BROWSER_SCREENSHOT_BLOCKED'
+    if (!isAbsolute(savePath)) {
+      throw new BrowserError(`browser: ${kind} savePath must be an absolute path`, code)
+    }
+    const file = resolve(savePath)
+    if (this.downloadDir !== undefined) {
+      const dir = resolve(this.downloadDir)
+      // Case-insensitive comparison: Windows paths are case-insensitive, and
+      // resolve() does not normalize case. Without this, C:\Users\X\Downloads
+      // and c:\users\x\downloads would be treated as different roots.
+      const dirLower = dir.toLowerCase()
+      const fileLower = file.toLowerCase()
+      if (fileLower !== dirLower && !fileLower.startsWith(dirLower + sep.toLowerCase())) {
+        throw new BrowserError(`browser: ${kind} savePath must be inside downloadDir "${dir}"`, code)
+      }
+    }
+    // Never replace an existing file: its previous content is unrecoverable,
+    // and the admitted directory may hold files the human put there. A new
+    // name is one tool call away.
+    if (existsSync(file)) {
+      throw new BrowserError(`browser: refusing to overwrite existing file "${file}" — use another name`, code)
+    }
+    return file
+  }
+
+  /**
+   * Download an HTTP(S) URL with the session's cookies to a local file.
+   * Admission is the shared {@link admitSavePath} gate; only the self-hosted
+   * host implements it (the desktop shell's embedded views delegate downloads
+   * to the real browser UI). Both admitted paths and screenshots are confined
+   * to `downloadDir`, so a prompt-injected agent cannot write arbitrary
+   * machine paths.
+   * @param session - the session whose cookies are used.
+   * @param request - the URL plus the absolute target path.
+   * @param signal - optional cancellation.
+   * @returns the path the file was written to.
    */
   async download(session: BrowserSessionId, request: { readonly url: string; readonly savePath: string }, signal?: AbortSignal): Promise<{ readonly path: string }> {
     const s = this.session(session)
@@ -1849,23 +1918,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new BrowserError(`browser: refusing download of non-HTTP(S) URL "${request.url}"`, 'BROWSER_DOWNLOAD_BLOCKED')
     }
-    // savePath admission: must be absolute; when downloadDir is configured it
-    // must resolve inside it (no ..-escape).
-    if (!isAbsolute(request.savePath)) {
-      throw new BrowserError('browser: download savePath must be an absolute path', 'BROWSER_DOWNLOAD_BLOCKED')
-    }
-    if (this.downloadDir !== undefined) {
-      const dir = resolve(this.downloadDir)
-      const file = resolve(request.savePath)
-      // Case-insensitive comparison: Windows paths are case-insensitive, and
-      // resolve() does not normalize case. Without this, C:\Users\X\Downloads
-      // and c:\users\x\downloads would be treated as different roots.
-      const dirLower = dir.toLowerCase()
-      const fileLower = file.toLowerCase()
-      if (fileLower !== dirLower && !fileLower.startsWith(dirLower + sep.toLowerCase())) {
-        throw new BrowserError(`browser: download savePath must be inside downloadDir "${dir}"`, 'BROWSER_DOWNLOAD_BLOCKED')
-      }
-    }
+    // savePath admission: the shared gate — absolute, inside `downloadDir`,
+    // and never an existing file. Screenshots use the very same one.
+    const savePath = this.admitSavePath(request.savePath, 'download')
     const downloadable = handle as { download?(url: string, savePath: string): Promise<void> }
     if (typeof downloadable.download !== 'function') {
       throw new BrowserError('browser: download is only available on the self-hosted browser', 'BROWSER_DOWNLOAD_UNSUPPORTED')
@@ -1878,13 +1933,13 @@ export class ElectronBrowserProvider implements BrowserProvider {
     // reply is harmlessly consumed by the RPC layer.
     const timeoutMs = 60_000
     await withTimeout(
-      downloadable.download(request.url, request.savePath),
+      downloadable.download(request.url, savePath),
       timeoutMs,
       signal,
       `browser: download timed out after ${timeoutMs}ms`,
     )
-    this.record(s, 'download', { url: request.url, savePath: request.savePath }, true, { result: request.savePath })
-    return { path: request.savePath }
+    this.record(s, 'download', { url: request.url, savePath }, true, { result: savePath })
+    return { path: savePath }
   }
 
   /**
@@ -1977,15 +2032,25 @@ export class ElectronBrowserProvider implements BrowserProvider {
     return this.saveScreenshot(data, request?.savePath, 'image/png')
   }
 
-  /** Build the data URL and optionally write the image to disk. */
+  /**
+   * Build the data URL and optionally write the image to disk. The caller's
+   * path goes through the SAME {@link admitSavePath} gate as a download — it
+   * must be absolute, resolve inside `downloadDir`, and not be an existing
+   * file — so a screenshot cannot be used to write to, or silently replace,
+   * files anywhere the DSH process happens to have permission (issue #13).
+   */
   private saveScreenshot(base64: string, savePath: string | undefined, mime: string): { dataUrl: string; path?: string } {
     if (savePath !== undefined) {
+      // Admission failures propagate unchanged: they describe the caller's
+      // path, not a disk problem.
+      const target = this.admitSavePath(savePath, 'screenshot')
       try {
-        writeFileSync(savePath, Buffer.from(base64, 'base64'))
-        return { dataUrl: `data:${mime};base64,${base64}`, path: savePath }
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, Buffer.from(base64, 'base64'))
+        return { dataUrl: `data:${mime};base64,${base64}`, path: target }
       } catch (error) {
         // Report the write problem but keep the capture usable.
-        throw new BrowserError(`browser: screenshot save to "${savePath}" failed: ${String(error)}`, 'BROWSER_SCREENSHOT_SAVE_FAILED', { cause: error })
+        throw new BrowserError(`browser: screenshot save to "${target}" failed: ${String(error)}`, 'BROWSER_SCREENSHOT_SAVE_FAILED', { cause: error })
       }
     }
     return { dataUrl: `data:${mime};base64,${base64}` }

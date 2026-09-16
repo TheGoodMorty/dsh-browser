@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { homedir } from 'node:os'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { ElectronBrowserProvider } from '../lib/browser-electron/provider.js'
@@ -152,24 +153,27 @@ test('available() delegates to the host probe', () => {
 
 test('download admission: scheme, absolute path, default downloads dir', async () => {
   const host = makeHost()
-  const p = new ElectronBrowserProvider(host)
+  // A real (temporary) Downloads directory keeps this test independent of both
+  // the machine's home layout and the no-overwrite rule.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-dl-default-'))
+  const p = new ElectronBrowserProvider(host, { downloadDir: dir })
   const sid = await p.open()
   await assert.rejects(p.download(sid, { url: 'file:///etc/x', savePath: 'C:/x/y' }), /non-HTTP/)
   await assert.rejects(p.download(sid, { url: 'not a url', savePath: 'C:/x/y' }), /unparseable/)
   await assert.rejects(p.download(sid, { url: 'https://a.example/f', savePath: 'relative.txt' }), /absolute/)
-  // Default downloadDir is the user's Downloads folder; an absolute path
-  // inside it is allowed.
-  const okPath = join(homedir(), 'Downloads', 'ok.bin')
+  // An absolute path inside the admitted directory is allowed.
+  const okPath = join(dir, 'ok.bin')
   const r = await p.download(sid, { url: 'https://a.example/f', savePath: okPath })
   assert.equal(r.path, okPath)
   await p.close(sid)
 })
 
 test('downloadDir containment blocks escape', async () => {
-  const p = new ElectronBrowserProvider(makeHost(), { downloadDir: 'C:/dl' })
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-dl-escape-'))
+  const p = new ElectronBrowserProvider(makeHost(), { downloadDir: dir })
   const sid = await p.open()
-  await p.download(sid, { url: 'https://a.example/f', savePath: 'C:/dl/ok.bin' })
-  await assert.rejects(p.download(sid, { url: 'https://a.example/f', savePath: 'C:/dl/../escape.bin' }), /inside downloadDir/)
+  await p.download(sid, { url: 'https://a.example/f', savePath: join(dir, 'ok.bin') })
+  await assert.rejects(p.download(sid, { url: 'https://a.example/f', savePath: join(dir, '..', 'escape.bin') }), /inside downloadDir/)
   await p.close(sid)
 })
 

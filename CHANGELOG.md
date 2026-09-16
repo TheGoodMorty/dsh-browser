@@ -652,3 +652,27 @@ bump `0.1.20 → 0.1.21`,将第十三轮(issue #7 macOS/Linux 输入框无法键
 **边界**:本环境起不了 Electron,未做真机点击冒烟;缺陷 3-A/3-B、导航后首次输入、`locateTab` 按代码 + 产物核对验证,缺陷 1/2 有真测试兜底。Windows 上手动确认一次工具栏与首击行为仍然值得。
 
 **状态**:第十五、十六两轮随一次提交落库(源码 + lib 产物 + 测试);未 bump 版本、未发布(发布时 bump)。宿主侧改动需推送并重装依赖、重启浏览器宿主子进程后才在安装副本上生效。
+
+---
+
+## 第十七轮(2026-09-16,issue #13 截图 savePath 沙盒逃逸 + 下载目录本地化)
+
+**根因**:`browser_screenshot` 的 `savePath` 直接 `writeFileSync`,不走任何准入 —— 可写到 DSH 进程有权限的任意路径(工作区之外、`$HOME`、`/.bashrc` 等),并会静默覆盖已存在文件(报告者实测把一个 13 字节文本文件覆盖成 17KB PNG)。而 `browser_download` 自第一轮就有准入(仅 HTTP(S)、绝对路径、`downloadDir` 限定),两条写盘路径的准入不对称,等于从截图侧绕过了只读沙箱的写保护。
+
+**修复**:抽出唯一的准入门 `admitSavePath(savePath, kind)`,下载与截图共用同一套规则 ——
+
+1. 必须为绝对路径;
+2. 解析后必须位于 `downloadDir` 内(大小写不敏感比较,拒绝 `..` 逃逸);
+3. 目标不得已存在:绝不静默替换现有文件(原有内容不可恢复,且该目录可能存放用户自己的文件),换一个文件名即可。
+
+截图路径另外补上父目录自动创建(`mkdirSync(dirname(target), { recursive: true })`),与下载"自动建目录"的行为对齐。准入失败按操作分别报 `BROWSER_DOWNLOAD_BLOCKED` / `BROWSER_SCREENSHOT_BLOCKED`(既有错误码保持不变)。
+
+**下载目录本地化**:默认下载目录不再写死 `~/Downloads`,改为按序探测 —— 配置的 `downloadDir` → 存在的 `XDG_DOWNLOAD_DIR`(freedesktop 标准,中文 Linux 桌面写的就是它)→ home 下第一个存在的 `Downloads`/`下载`/`下載` → 回退 `~/Downloads`(首次使用时创建)。中文桌面不再需要手动配置 `downloadDir`。
+
+**文档同步**:`browser_screenshot`/`browser_download` 的 `savePath` 参数描述、README 中英、`docs/tool-reference.md`、`docs/user-guide.md` 均改为"限定在 `downloadDir` 内且不覆盖已有文件";`downloadDir` 配置行的默认值与适用范围(下载 + 截图)一并更新。
+
+**验证**:`tsc` 构建零错误;新增 `tests/save-path-admission.test.mjs` 4 个用例 —— 截图越界/相对路径/`..` 逃逸被拒、截图正常写入且拒绝覆盖、下载同样拒绝覆盖、中文目录(显式配置与 `XDG_DOWNLOAD_DIR` 默认值)可用且仍受限;`node --test tests/*.test.mjs` **35/35 全部通过**(原 31 项保持通过;两条下载准入测试顺带改用临时目录,不再依赖 `~/Downloads`/`C:/dl` 的真实状态)。
+
+**行为变更提示**:下载现在同样拒绝覆盖已存在文件(此前会覆盖)。这是与截图对齐同一准入门时的刻意选择;需要替换同名文件时换一个文件名。
+
+**状态**:已改并随本次提交落库(源码 + lib 产物 + 测试 + 文档);未 bump 版本、未发布(发布时 bump)。
