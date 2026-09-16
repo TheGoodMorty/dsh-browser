@@ -309,7 +309,9 @@ npm run build
 | 第十六轮 | 2026-09-16 | **自托管三连修复**(issue #10):① `browser_open` 用 `performance.timeOrigin` 指纹 + `readyState` 有界(5s)等新文档 settle,不再返回"有标题、0 元素"的空快照;② 新增等待式 `presentView` 屏障(先 materialize 视图再 showView,再发 ping 屏障;子进程消息严格串行),`click`/`type`/`key` 派发 `Input.*` 前必须 present,失败明确报 `BROWSER_VIEW_NOT_PRESENTED` 而非假报成功;③ `createView` 前有界加载 `about:blank`,新视图必有渲染进程(宿主重启后卡死的根因);④ `did-navigate` 标记强制重呈现、命令 20s 有界超时、子进程 stderr 与退出码落 `$DSH_HOME/logs/dsh-builtin-browser-host.log`(2MB 自截断)、`locateTab` 兼容裸 uuid 与 `tab:<uuid>` |
 | 第十七轮 | 2026-09-16 | **截图 savePath 收敛 + 下载目录本地化**(issue #13):`browser_screenshot` 原先直接 `writeFileSync`,可写进程可达的任意路径并**静默覆盖**已有文件(等于绕过只读沙箱的写保护)→ 抽出唯一下载/截图共用准入门 `admitSavePath`(绝对路径 + `downloadDir` 内 + **不覆盖已存在文件**),截图补父目录自动创建;默认下载目录不再写死 `~/Downloads`,按序探测 `downloadDir` → `XDG_DOWNLOAD_DIR` → `~/Downloads`/`~/下载`/`~/下載` → 回退(中文桌面免配置) |
 
-> 第十五~十七轮与 macOS 二进制探测修复**已提交但尚未发版**(npm 最新为 `0.1.21`):macOS 用户、以及需要上述修复的部署请从 git 安装,或等下一次发版。
+| **0.1.22** | 2026-09-16 | **发布**:macOS 二进制探测修复(issue #9 / #14)与第十五~十七轮(issue #11 工具栏 SyntaxError / #10 自托管三连 / #13 截图 savePath + 下载目录)随 **0.1.22** 收录(构建零错误、**35 项测试全绿**,tag `v0.1.22`) |
+
+> registry 上的最新版本以顶部 npm 徽章为准:本次 `0.1.22` 已入库并打 tag;若徽章仍显示 `0.1.21`,说明该版本尚未 publish。
 
 ## 特别感谢
 
