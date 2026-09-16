@@ -604,6 +604,18 @@ bump `0.1.20 → 0.1.21`,将第十三轮(issue #7 macOS/Linux 输入框无法键
 
 ---
 
+## macOS 二进制探测修复(2026-09-09,issue #9 / #14)
+
+**根因**:`electronDistExe()` 只探测 `dist/electron(.exe)`,而 macOS 的 Electron 二进制在 bundle 内部(`dist/Electron.app/Contents/MacOS/Electron`)。bundled 与 profile/anchor 两条解析层共用这个探测函数,于是 macOS 上永远定位不到二进制,任何 `browser_*` 调用都以 "no usable browser provider is registered"(或 "cannot locate the Electron binary")失败。
+
+**修复**:在共用的平台探测里补上 darwin 候选路径,两层同时受益;新增覆盖该路径的回归测试。
+
+**验证**:`tsc` 构建零错误;`node --test tests/*.test.mjs` **26/26 全部通过**(含新增的 macOS 布局用例);lib 重建同步。
+
+**状态**:已提交并推送(`8bef6f8`,upstream master),**尚未随版本发布**(npm 最新仍为 0.1.21)——macOS 用户需等下一次发版,或从 git 安装。
+
+---
+
 ## 第十五轮(2026-09-16,issue #11 工具栏脚本解析期 SyntaxError 导致整个工具栏失效)
 
 **根因**:`host-main.ts` 的工具栏内联脚本用 `const bridge = window.bridge` 取 preload 通过 `contextBridge.exposeInMainWorld('bridge', …)` 装上的句柄。`exposeInMainWorld` 装的是**不可配置**的全局属性,而全局作用域再声明同名 `const`(或 `let`/`class`)会命中规范里的 `HasRestrictedGlobalProperty` —— 这是**解析期 early error**,整段 `<script>` 一行都不执行:`tb`/地址栏/回退前进刷新/新标签/标签条/错误条全部失效(报告者的根因分析完全正确)。

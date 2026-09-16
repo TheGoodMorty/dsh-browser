@@ -168,7 +168,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### 等待页面就绪
 
-- **`browser_open` 之后、`browser_snapshot` 之前,慢站点请先 `browser_wait`**:传 `url`(你打开的地址)与可选的 `selector`,等它返回 `ready: true` 再拍照——否则拍到的是旧页面或白屏。
+- **`browser_open`/导航已有界等待新文档解析完成**(`readyState` + 文档指纹,不把同 URL 重载或 A→B→A 重定向误判成旧文档),但仍**不等异步内容**:慢站点或依赖 XHR 渲染的页面,请在 `browser_snapshot` 之前先 `browser_wait`——传 `url`(你打开的地址)与可选的 `selector`,等它返回 `ready: true` 再拍照,否则拍到的是旧页面或白屏/空元素列表。
 - 页面里看不到的内容先想 iframe / Shadow DOM:快照与无障碍树会穿透同源 iframe 与 shadow root 并标注 `(iframe)`,坐标始终是顶层文档坐标,可直接用 `browser_click`;DOM 选择器则是 frame 作用域的,需用 `browser_execute` 经 `iframe.contentDocument` 访问。
 
 ### 语义定位(`target`)与无障碍树
@@ -255,7 +255,7 @@ agent (browser_* 工具)
 - `browser_restrict` 是防误操作的**软护栏**,不是安全边界:模型可以自行解除白名单。
 - 页面弹窗(`window.open` / `target=_blank`)不再覆盖当前视图:HTTP(S) 弹窗会在同一会话窗口**新开一个标签页**并计入历史,原页面与 opener 上下文保留;非 HTTP(S) 弹窗(空 URL 弹窗承接、`mailto:`、自定义协议)仍**放行原生窗口**,交给系统处理——这类弹窗不纳入会话模型。
 - `browser_auth` 的 cookie 往返不保留 `hostOnly`/`sameSite` 字段(host-only cookie 恢复后变成 domain cookie);仅自托管浏览器可用。
-- 自托管浏览器子进程崩溃(或宿主 DSH 重启)后会自动重启;崩溃前已打开的会话在**下一次调用时自动重建**——仅页面状态丢失,无需手动 `browser_reset_session`。`browser_reset_session` 仍可用于主动重置。
+- 自托管浏览器子进程崩溃(或宿主 DSH 重启)后会自动重启;崩溃前已打开的会话在**下一次调用时自动重建**——仅页面状态丢失,无需手动 `browser_reset_session`。`browser_reset_session` 仍可用于主动重置。新视图创建前会先有界加载 `about:blank`(保证视图一存在就有可响应的渲染进程),宿主侧命令另有 20s 有界超时;子进程 stderr 与退出码/信号落到 `$DSH_HOME/logs/dsh-builtin-browser-host.log`(2MB 自截断),纯 `dsh web` 自托管可据此自助排查崩溃循环。
 - electron 随插件安装;但 Electron 44+ 不再随安装下载二进制(约 100MB,需网络)——插件探测是纯文件系统、不触发其懒下载,二进制缺失时首次使用会报错并提示先 `npx install-electron`;也可预装 `ELECTRON_PATH` 指定的二进制。
 - 本插件不含浏览器列 UI——那是宿主外壳的配套,别把"浏览器列"当成插件能力。
 
@@ -304,6 +304,12 @@ npm run build
 | 第十三轮 | 2026-08-28 | **macOS/Linux 输入框无法键入修复**(issue #7):0.1.16 引入的 Windows 焦点路由(mousedown 强制 focus + 窗口 refocus 恢复)未做平台判断,与 macOS 原生 click-to-focus 冲突导致登录框收不到键入 → 两处焦点逻辑加 `win32` 平台门,非 Windows 恢复原生行为 |
 | 第十四轮 | 2026-08-28 | **window.open/target=_blank 新开标签**(issue #8):HTTP(S) 弹窗不再 loadURL 覆盖当前视图,转交父进程在**同一会话窗口新开标签**——原页面与 opener 上下文保留(门户「工作台」类跳转不再 403),跳转计入会话历史;未分组视图保留回退;非 HTTP 弹窗仍放行系统 |
 | **0.1.21** | 2026-08-28 | **发布**:第十三/十四轮随 **0.1.21** 发布(构建零错误、25 项测试全绿) |
+| macOS 二进制探测 | 2026-09-09 | **Electron.app 布局探测**(issue #9 / #14):`electronDistExe()` 只认 `dist/electron(.exe)`,macOS 的 `dist/Electron.app/Contents/MacOS/Electron` 永远找不到 → 共用平台探测补 darwin 候选路径(bundled 与 profile/anchor 两层同时受益);新增回归测试 |
+| 第十五轮 | 2026-09-16 | **工具栏脚本解析期 SyntaxError**(issue #11):内联脚本 `const bridge = window.bridge` 与 `contextBridge.exposeInMainWorld` 装上的不可配置全局冲突(`HasRestrictedGlobalProperty`)→ **解析期** early error,整段脚本一行都不执行(地址栏回车 / 四个导航按钮 / 标签条 / 错误条全失效)→ 整段包进 IIFE 并把句柄改名 `tb`,从结构上杜绝同类冲突;新增 3 个工具栏回归测试(从**发布产物**解析出脚本、在 `vm` 里按 contextBridge 语义真执行) |
+| 第十六轮 | 2026-09-16 | **自托管三连修复**(issue #10):① `browser_open` 用 `performance.timeOrigin` 指纹 + `readyState` 有界(5s)等新文档 settle,不再返回"有标题、0 元素"的空快照;② 新增等待式 `presentView` 屏障(先 materialize 视图再 showView,再发 ping 屏障;子进程消息严格串行),`click`/`type`/`key` 派发 `Input.*` 前必须 present,失败明确报 `BROWSER_VIEW_NOT_PRESENTED` 而非假报成功;③ `createView` 前有界加载 `about:blank`,新视图必有渲染进程(宿主重启后卡死的根因);④ `did-navigate` 标记强制重呈现、命令 20s 有界超时、子进程 stderr 与退出码落 `$DSH_HOME/logs/dsh-builtin-browser-host.log`(2MB 自截断)、`locateTab` 兼容裸 uuid 与 `tab:<uuid>` |
+| 第十七轮 | 2026-09-16 | **截图 savePath 收敛 + 下载目录本地化**(issue #13):`browser_screenshot` 原先直接 `writeFileSync`,可写进程可达的任意路径并**静默覆盖**已有文件(等于绕过只读沙箱的写保护)→ 抽出唯一下载/截图共用准入门 `admitSavePath`(绝对路径 + `downloadDir` 内 + **不覆盖已存在文件**),截图补父目录自动创建;默认下载目录不再写死 `~/Downloads`,按序探测 `downloadDir` → `XDG_DOWNLOAD_DIR` → `~/Downloads`/`~/下载`/`~/下載` → 回退(中文桌面免配置) |
+
+> 第十五~十七轮与 macOS 二进制探测修复**已提交但尚未发版**(npm 最新为 `0.1.21`):macOS 用户、以及需要上述修复的部署请从 git 安装,或等下一次发版。
 
 ## 特别感谢
 
