@@ -601,3 +601,54 @@ bump `0.1.19 → 0.1.20`,将第十一轮(issue #5 会话自愈)、第十二轮(i
 bump `0.1.20 → 0.1.21`,将第十三轮(issue #7 macOS/Linux 输入框无法键入)与第十四轮(issue #8 window.open/target=_blank 覆盖当前视图)随版本发布(tag `v0.1.21`)。README 中英同步:更新记录新增三行、验证版本表 bump 0.1.21、弹窗行为描述与修复后的代码对齐。
 
 **验证**:`tsc` 构建零错误;`node --test tests/*.test.mjs` **25 项全部通过**。
+
+---
+
+## 第十五轮(2026-09-16,issue #11 工具栏脚本解析期 SyntaxError 导致整个工具栏失效)
+
+**根因**:`host-main.ts` 的工具栏内联脚本用 `const bridge = window.bridge` 取 preload 通过 `contextBridge.exposeInMainWorld('bridge', …)` 装上的句柄。`exposeInMainWorld` 装的是**不可配置**的全局属性,而全局作用域再声明同名 `const`(或 `let`/`class`)会命中规范里的 `HasRestrictedGlobalProperty` —— 这是**解析期 early error**,整段 `<script>` 一行都不执行:`tb`/地址栏/回退前进刷新/新标签/标签条/错误条全部失效(报告者的根因分析完全正确)。
+
+**修复**:两件一起做,而不只改名 ——
+
+1. 整段脚本包进 IIFE,所有绑定落进函数作用域:这一类与 `exposeInMainWorld` 全局的冲突从结构上不可能再出现(以后新增 expose 也不会重演);
+2. 局部名改为 `tb`,断掉"照抄 `const bridge`"的习惯(报告者建议);
+3. 注释写明为什么不能改回顶层 `const`,并注明该段位于 TS 模板字符串内(反引号会触发 TS1005)。
+
+**验证**:新增 `tests/toolbar.test.mjs`(3 用例)—— 从**随包发布的** `lib/browser-electron/host-main.js` 里按 JS 语义解析出 `TOOLBAR_HTML` / `TOOLBAR_PRELOAD`,再在 `vm` 里真执行:全局按 `contextBridge` 的方式装成 non-configurable,配一套 stub DOM。用例 1「脚本在 contextBridge 全局下解析并接线」、用例 2「显式复现 #11 故障模式」(对未修版本抛 `Identifier 'bridge' has already been declared`,与 CDP 抓到的一字不差)、用例 3「全局作用域零声明」是真守卫。顺带审计:全仓只有这一处内联 `<script>`,工具栏 HTML 无内联 `on*=` 与 `javascript:` URL,IIFE 包裹不破坏其它绑定。
+
+---
+
+## 第十六轮(2026-09-16,issue #10 自托管三连:空快照 / 点击静默失效 / 崩溃不自愈)
+
+**缺陷 1 · `browser_open` 返回「有标题、0 个交互元素」的空快照**
+
+- 根因:`Page.navigate` 在导航 commit 时就 resolve,而工具层紧接着取快照,此时新文档已 commit(`location.href`/`document.title` 已是新的)但 DOM 尚未解析 → 标题正确、元素为空。
+- 修复:`navigate()` 先读导航前的文档指纹(`performance.timeOrigin`),导航后在有界 5s、best-effort 前提下等新文档 `readyState ∈ interactive/complete`。指纹用于区分「同 URL 重载」与「A→B→A 重定向」,不会把旧文档误判成新文档;commit 期间 `Execution context was destroyed` 继续轮询而非放弃;`reload()` 与 back/forward 同样处理。成本受控:文档看着已 settle 但指纹未变(同文档/锚点跳转)只等 150ms grace,不烧光预算。
+
+**缺陷 2 · 点击静默失效(报成功但页面收不到任何事件)**
+
+- 根因:`showViewInWindow()` 只对**已存在**的视图置可见,而宿主侧 `showActive` 是 fire-and-forget;新标签页里 `newTab()` 的 `showActive()` 与子进程 `createView` 竞争——`showView` 先到时 `windowOfView(viewId)` 查不到视图、静默跳过,视图随后才创建,于是从未被 present。没有显示表面的 `WebContentsView`,Chromium 会静默丢弃合成的 `Input.*` 事件(`Runtime.evaluate` 不受影响,所以快照/执行都正常,只有点击与输入无效),而工具层无从区分"成功"与"无效"。
+- 修复:新增**等待式** host seam `presentView?(handle, label)`:先 materialize 视图,再 `showView`,最后发一个 ping 屏障;同时把子进程消息处理改为严格串行(原 `void handle(...)` 会让 op 互相超车)。`click()`/`type()`/`key()` 在派发任何 `Input.*` 前调用它,present 不了就报 `BROWSER_VIEW_NOT_PRESENTED` 并带原因,不再假报 "Clicked."。
+
+**缺陷 3-A · userData 隔离被未闭合的文档注释吞掉**
+
+- 根因:`host-main.ts` 的块注释缺少收尾 `*/`,`try { app.setPath('userData', …) }` 整段被注释吞掉,产出物里根本没有这段代码。
+- 修复:闭合注释,`app.setPath('userData', join(base, 'dsh-builtin-browser-host'))` 已是真实代码(已在发布产物中核对)。
+
+**缺陷 3-B · 新建视图无渲染进程时 CDP 永不 settle(「宿主重启后不自愈」卡死的那一步)**
+
+- 根因:新建的空白视图还没有可响应的渲染进程,而宿主重启后的第一个动作就是读 `location.href` → 命令永不 settle,表现为一串 timeout。
+- 修复:`createView` 在应答前先有界(3s)加载 `about:blank`,视图一存在就有可响应的渲染进程。
+
+**补充修复**
+
+- 导航后第一次输入被丢:`did-navigate` 给视图打 `needsRepresent` 标记,`showViewInWindow` 对带标记的视图强制走一次 hide/show + remove/add —— 原来「已经可见就跳过」的防闪烁快速路径,恰好把新渲染进程建立显示表面这一步跳掉了。
+- 宿主侧 `command` 加 20s 有界超时:渲染进程卡死得到明确错误而不是挂死。
+- 子进程 stderr + 退出码/信号落到 `$DSH_HOME/logs/dsh-builtin-browser-host.log`(2MB 自截断):纯 `dsh web` 自托管场景终于能自助排查宿主崩溃循环。
+- `locateTab()` 同时接受裸 uuid 与 `tab:<uuid>`,消除自相矛盾的 "is not open in this session"(却把该 tab 列出来)。
+
+**验证**:`tsc -p tsconfig.json` 零错误;由 `src/` 重新编译 `lib/` 与已提交产物**逐字节一致**(本仓库提交 lib 产物);`node --test tests/*.test.mjs` **31/31 全部通过**(未修版本 739ms → 修复后约 993ms,无明显变慢),其中新增 2 条针对缺陷 1/2 的回归测试对未修版本失败、对修复版本通过(真守卫);行为脚本模拟 commit→loading→interactive 时 navigate 轮询 3 次才返回(证明真的等了解析),同文档导航 152ms 返回(证明没卡满预算)。
+
+**边界**:本环境起不了 Electron,未做真机点击冒烟;缺陷 3-A/3-B、导航后首次输入、`locateTab` 按代码 + 产物核对验证,缺陷 1/2 有真测试兜底。Windows 上手动确认一次工具栏与首击行为仍然值得。
+
+**状态**:第十五、十六两轮随一次提交落库(源码 + lib 产物 + 测试);未 bump 版本、未发布(发布时 bump)。宿主侧改动需推送并重装依赖、重启浏览器宿主子进程后才在安装副本上生效。

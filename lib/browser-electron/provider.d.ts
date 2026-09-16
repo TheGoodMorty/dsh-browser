@@ -38,6 +38,20 @@ export interface ElectronBrowserViewHost {
      */
     showView?(handle: ElectronViewHandle, label?: string): void;
     /**
+     * Optional: (re)present a view and WAIT until the host confirms it. Chromium
+     * silently drops CDP-synthesized input (`Input.*`) for a view that has no
+     * display surface, which made clicks/typing report success while the page
+     * received nothing (and made the first input after a navigation vanish,
+     * because the replaced renderer has no surface yet). Unlike
+     * {@link showView}, this round-trips an RPC barrier that is ordered AFTER
+     * the show on the same socket, so its reply means the view is on screen.
+     * Rejects when the view cannot be presented; a host without this method is
+     * assumed to present every view (headless/probe hosts).
+     * @param handle - the handle to present.
+     * @param label - human-readable session/task label, as in {@link showView}.
+     */
+    presentView?(handle: ElectronViewHandle, label?: string): Promise<void>;
+    /**
      * Optional cheap usability probe (no network): whether the host can back
      * views at all right now. The self-hosted host checks for a usable Electron
      * binary; a host without the probe is assumed usable. Lets the seam's
@@ -226,6 +240,44 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
     navigate(session: BrowserSessionId, request: {
         readonly url: string;
     }, signal?: AbortSignal): Promise<void>;
+    /**
+     * A per-document stamp: `performance.timeOrigin` is unique per document load,
+     * so it tells a same-URL reload and an A→B→A redirect apart from the document
+     * that was current before the navigation. Empty string when unreadable.
+     */
+    private documentStamp;
+    /**
+     * One cheap in-page reading of the document's identity and parse state.
+     *
+     * Returns null when the page did NOT answer (mid-commit, execution context
+     * destroyed) — the caller keeps waiting. A page that answered with an
+     * unexpected shape (an override or a non-conforming host; the production
+     * expression always yields a string) is reported as `unknown` rather than as
+     * "no answer": blocking the navigation for the whole budget on a page that
+     * demonstrably responded has no upside.
+     */
+    private documentProbe;
+    /**
+     * Page.navigate resolves at navigation COMMIT, not at load: the new document
+     * is already current (so location.href and document.title are the new page's)
+     * while its DOM is still being parsed. browser_open snapshots immediately
+     * after navigating, which is why it could report the right title with zero
+     * interactive elements — and why a separate browser_snapshot right after
+     * always found them.
+     *
+     * Wait — bounded, best-effort — for the new document to settle: readyState
+     * must reach interactive/complete AND the document identity must have
+     * changed. A page that never settles must not fail a navigation that already
+     * succeeded, so a timeout here is swallowed.
+     */
+    private settleDocument;
+    /**
+     * Make sure the active tab's view can actually receive synthesized input.
+     * Chromium drops `Input.*` events for a view with no display surface, so this
+     * runs before click/type/key and fails loudly (BROWSER_VIEW_NOT_PRESENTED)
+     * rather than reporting a success the page never saw.
+     */
+    private present;
     /** Execute JS in the active tab's page context. */
     execute(session: BrowserSessionId, request: BrowserExecuteRequest, signal?: AbortSignal): Promise<BrowserExecuteResult>;
     /**

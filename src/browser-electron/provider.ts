@@ -135,6 +135,20 @@ export interface ElectronBrowserViewHost {
    */
   showView?(handle: ElectronViewHandle, label?: string): void
   /**
+   * Optional: (re)present a view and WAIT until the host confirms it. Chromium
+   * silently drops CDP-synthesized input (`Input.*`) for a view that has no
+   * display surface, which made clicks/typing report success while the page
+   * received nothing (and made the first input after a navigation vanish,
+   * because the replaced renderer has no surface yet). Unlike
+   * {@link showView}, this round-trips an RPC barrier that is ordered AFTER
+   * the show on the same socket, so its reply means the view is on screen.
+   * Rejects when the view cannot be presented; a host without this method is
+   * assumed to present every view (headless/probe hosts).
+   * @param handle - the handle to present.
+   * @param label - human-readable session/task label, as in {@link showView}.
+   */
+  presentView?(handle: ElectronViewHandle, label?: string): Promise<void>
+  /**
    * Optional cheap usability probe (no network): whether the host can back
    * views at all right now. The self-hosted host checks for a usable Electron
    * binary; a host without the probe is assumed usable. Lets the seam's
@@ -433,10 +447,15 @@ export class ElectronBrowserProvider implements BrowserProvider {
    */
   private locateTab(session: BrowserSessionId, tabId: string): { s: Session; index: number } {
     const s = this.session(session)
-    const own = s.tabs.findIndex(tab => tab.id === tabId)
+    // Accept the bare uuid as well as the "tab:<uuid>" form the tools print:
+    // ids are globally unique, so requiring the printed prefix only produced a
+    // misleading "is not open in this session" error that listed the very tab
+    // the caller had just named.
+    const wanted = stripTabPrefix(tabId)
+    const own = s.tabs.findIndex(tab => stripTabPrefix(tab.id) === wanted)
     if (own >= 0) return { s, index: own }
     for (const other of this.sessions.values()) {
-      const index = other.tabs.findIndex(tab => tab.id === tabId)
+      const index = other.tabs.findIndex(tab => stripTabPrefix(tab.id) === wanted)
       if (index >= 0) return { s: other, index }
     }
     const ownIds = s.tabs.map(t => t.id).join(', ') || '(none)'
@@ -479,6 +498,8 @@ export class ElectronBrowserProvider implements BrowserProvider {
       // evaluate paths so a wedged navigation surfaces as an error instead of
       // blocking the tool call forever.
       const timeoutMs = 30_000
+      // Document identity of the page we are leaving (see settleDocument).
+      const before = await this.documentStamp(handle)
       const result = await withTimeout(
         handle.sendCommand(CDP_PAGE_NAVIGATE, { url } satisfies CdpNavigateParams),
         timeoutMs,
@@ -494,13 +515,124 @@ export class ElectronBrowserProvider implements BrowserProvider {
       if (typeof errorText === 'string' && errorText !== '') {
         throw new BrowserError(`browser: navigation to "${url}" failed: ${errorText}`, 'BROWSER_NAVIGATION_FAILED')
       }
+      // Record as soon as the navigation has committed: history bookkeeping must
+      // not wait on the best-effort settle below (which only delays what the
+      // NEXT observation sees, not whether this action happened).
       this.record(s, 'navigate', { url }, true)
+      await this.settleDocument(handle, before, signal)
       this.showActive(s)
     } catch (error) {
       if (!(error instanceof BrowserError && (error as { code?: string }).code === 'BROWSER_NAVIGATION_BLOCKED')) {
         this.record(s, 'navigate', { url }, false, { error: String(error) })
       }
       throw error
+    }
+  }
+
+  /**
+   * A per-document stamp: `performance.timeOrigin` is unique per document load,
+   * so it tells a same-URL reload and an A→B→A redirect apart from the document
+   * that was current before the navigation. Empty string when unreadable.
+   */
+  private async documentStamp(handle: ElectronViewHandle): Promise<string> {
+    const probe = await this.documentProbe(handle)
+    return probe?.stamp ?? ''
+  }
+
+  /**
+   * One cheap in-page reading of the document's identity and parse state.
+   *
+   * Returns null when the page did NOT answer (mid-commit, execution context
+   * destroyed) — the caller keeps waiting. A page that answered with an
+   * unexpected shape (an override or a non-conforming host; the production
+   * expression always yields a string) is reported as `unknown` rather than as
+   * "no answer": blocking the navigation for the whole budget on a page that
+   * demonstrably responded has no upside.
+   */
+  private async documentProbe(handle: ElectronViewHandle): Promise<{ stamp: string; readyState: string } | null> {
+    try {
+      const result = await withTimeout(
+        handleSendEvaluate(handle, 'String(performance.timeOrigin) + "|" + document.readyState'),
+        3_000,
+        undefined,
+        'browser: document probe timed out',
+      )
+      if (!result.ok) return null
+      if (typeof result.value !== 'string') return { stamp: '', readyState: 'unknown' }
+      const [stamp = '', readyState = ''] = result.value.split('|')
+      return { stamp, readyState }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Page.navigate resolves at navigation COMMIT, not at load: the new document
+   * is already current (so location.href and document.title are the new page's)
+   * while its DOM is still being parsed. browser_open snapshots immediately
+   * after navigating, which is why it could report the right title with zero
+   * interactive elements — and why a separate browser_snapshot right after
+   * always found them.
+   *
+   * Wait — bounded, best-effort — for the new document to settle: readyState
+   * must reach interactive/complete AND the document identity must have
+   * changed. A page that never settles must not fail a navigation that already
+   * succeeded, so a timeout here is swallowed.
+   */
+  private async settleDocument(handle: ElectronViewHandle, before: string, signal?: AbortSignal): Promise<void> {
+    const started = Date.now()
+    const deadline = started + SETTLE_TIMEOUT_MS
+    for (;;) {
+      if (signal?.aborted === true) return
+      // A probe failure is expected while the navigation commits (the context is
+      // being destroyed) — keep polling rather than giving up.
+      const probe = await this.documentProbe(handle)
+      if (probe !== null) {
+        const settled = probe.readyState === 'interactive'
+          || probe.readyState === 'complete'
+          || probe.readyState === 'unknown'
+        const isNewDocument = before === '' || probe.stamp === '' || probe.stamp !== before
+        // The common case: the new document exists and is parsed — return now.
+        if (settled && isNewDocument) return
+        // Same document (hash navigation, cancelled/aborted load): there is no
+        // parse to wait for, so do not burn the budget. Outlast the brief
+        // window in which the OUTGOING document may still answer instead.
+        if (settled && Date.now() - started >= SETTLE_GRACE_MS) return
+      }
+      if (Date.now() >= deadline) return
+      await delay(SETTLE_POLL_MS, signal)
+    }
+  }
+
+  /**
+   * Make sure the active tab's view can actually receive synthesized input.
+   * Chromium drops `Input.*` events for a view with no display surface, so this
+   * runs before click/type/key and fails loudly (BROWSER_VIEW_NOT_PRESENTED)
+   * rather than reporting a success the page never saw.
+   */
+  private async present(s: Session, signal?: AbortSignal): Promise<void> {
+    const { handle } = this.activeTab(s)
+    const present = this.host.presentView?.bind(this.host)
+    if (present === undefined) {
+      this.showActive(s)
+      return
+    }
+    signal?.throwIfAborted()
+    const timeoutMs = 10_000
+    try {
+      await withTimeout(
+        present(handle, s.label),
+        timeoutMs,
+        signal,
+        `browser: presenting the page view timed out after ${timeoutMs}ms`,
+      )
+      this.showActive(s)
+    } catch (error) {
+      throw new BrowserError(
+        `browser: the page view is not presented, so synthesized input would be silently dropped (${String(error)})`,
+        'BROWSER_VIEW_NOT_PRESENTED',
+        { cause: error },
+      )
     }
   }
 
@@ -1033,6 +1165,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
       x = request.x
       y = request.y
     }
+    // Input.* is only delivered to a view with a current display surface; the
+    // barrier also re-presents after a navigation replaced the renderer.
+    await this.present(s, signal)
     const press = (type: 'mousePressed' | 'mouseReleased'): Promise<Record<string, unknown>> =>
       handle.sendCommand('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 } satisfies CdpMouseParams)
     const timeoutMs = 30_000
@@ -1078,6 +1213,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
     }
     const text = 'text' in request ? request.text : ''
     const timeoutMs = 30_000
+    // Input.insertText goes through the Input domain: same display-surface
+    // requirement as click/key.
+    await this.present(s, signal)
     try {
       await withTimeout(
         handle.sendCommand('Input.insertText', { text } satisfies CdpInsertTextParams),
@@ -1149,6 +1287,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
     }
     const entry = entries[target]
     if (entry?.id === undefined) throw new BrowserError('browser: history entry missing id', 'BROWSER_HISTORY_INVALID')
+    // A history step is a navigation too: the classic A→B→A redirect would
+    // otherwise read the outgoing document's identity (see settleDocument).
+    const before = await this.documentStamp(handle)
     await withTimeout(
       handle.sendCommand('Page.navigateToHistoryEntry', { entryId: entry.id }),
       timeoutMs,
@@ -1157,6 +1298,7 @@ export class ElectronBrowserProvider implements BrowserProvider {
       () => { void handle.sendCommand('Page.stopLoading').catch(() => {}) },
     )
     this.record(s, direction === -1 ? 'back' : 'forward', {}, true)
+    await this.settleDocument(handle, before, signal)
     this.showActive(s)
   }
 
@@ -1176,6 +1318,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
     const { handle } = this.activeTab(s)
     signal?.throwIfAborted()
     const timeoutMs = 30_000
+    // Same-URL reload: only the per-load document identity can tell the new
+    // document from the old one, so capture it before reloading.
+    const before = await this.documentStamp(handle)
     await withTimeout(
       handle.sendCommand('Page.reload', { ignoreCache: false }),
       timeoutMs,
@@ -1185,6 +1330,7 @@ export class ElectronBrowserProvider implements BrowserProvider {
       () => { void handle.sendCommand('Page.stopLoading').catch(() => {}) },
     )
     this.record(s, 'reload', {}, true)
+    await this.settleDocument(handle, before, signal)
     this.showActive(s)
   }
 
@@ -1199,6 +1345,8 @@ export class ElectronBrowserProvider implements BrowserProvider {
     }
     const params = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.vk, nativeVirtualKeyCode: spec.vk, ...spec.text !== undefined ? { text: spec.text } : {} }
     const timeoutMs = 15_000
+    // Input.dispatchKeyEvent is subject to the same display-surface rule.
+    await this.present(s, signal)
     const release = (): Promise<Record<string, unknown>> =>
       handle.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', ...params })
     try {
@@ -2064,6 +2212,39 @@ export class ElectronBrowserProvider implements BrowserProvider {
     )
     return result.ok && typeof result.value === 'string' ? result.value : ''
   }
+}
+
+/**
+ * Hard cap on waiting for a navigation's new document to be parsed. Bounded and
+ * best-effort: a page that never settles must not fail the navigation.
+ */
+const SETTLE_TIMEOUT_MS = 5_000
+
+/**
+ * When the document already looks settled but its identity has NOT changed
+ * (same-document navigation, or the outgoing document still answering), wait
+ * only this long before returning — there is no parse in flight to wait for.
+ */
+const SETTLE_GRACE_MS = 150
+
+/** Poll interval for the document-settle loop. */
+const SETTLE_POLL_MS = 25
+
+/** `tab:<uuid>` ↔ `<uuid>`: ids accept either form (see locateTab). */
+function stripTabPrefix(id: string): string {
+  return id.startsWith('tab:') ? id.slice(4) : id
+}
+
+/** Abortable sleep used by the settle loop. */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      if (signal !== undefined) signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => { clearTimeout(timer); resolve() }
+    if (signal !== undefined) signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /**

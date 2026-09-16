@@ -26,6 +26,7 @@
  */
 
 import { execFileSync, spawn, type ChildProcessByStdio } from 'node:child_process'
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync, readdirSync, readlinkSync } from 'node:fs'
@@ -37,6 +38,9 @@ import type { ExportedCookie } from '../browser/types.js'
 
 /** How long to wait for the child to signal readiness before failing. */
 const READY_TIMEOUT_MS = 20_000
+
+/** Budget for the present/barrier round-trips (see presentView). */
+const PRESENT_TIMEOUT_MS = 10_000
 
 /** Safety cap on a single RPC reply line (base64 downloads are the big ones). */
 const MAX_RPC_BUFFER_BYTES = 512 * 1024 * 1024
@@ -461,8 +465,13 @@ class ElectronChildClient {
     })
     this.child.stderr.setEncoding('utf8')
     this.child.stderr.on('data', chunk => {
-      // Diagnostics only; never parse stderr as protocol.
-      process.stderr.write(`[dsh-browser host] ${String(chunk)}`)
+      // Diagnostics only; never parse stderr as protocol. Mirror to a log file
+      // as well: under a plain `dsh web` self-host these lines only ever reach
+      // the DSH process's stderr, so a host that crashes in a restart loop left
+      // the user with a string of timeouts and no stack to act on.
+      const text = String(chunk)
+      process.stderr.write(`[dsh-browser host] ${text}`)
+      appendHostLog(text)
     })
     // Send the spawn token over stdin (first line). The child reads it from
     // stdin instead of argv so the token is never visible in the process
@@ -473,11 +482,17 @@ class ElectronChildClient {
     // A failed spawn (bad/corrupt binary) emits 'error' — without a listener
     // that would crash the whole DSH process.
     this.child.on('error', error => {
-      process.stderr.write(`[dsh-browser host] spawn error: ${String(error)}\n`)
+      const line = `spawn error: ${String(error)}`
+      process.stderr.write(`[dsh-browser host] ${line}\n`)
+      appendHostLog(`${line}\n`)
       this.fail(new Error(`dsh-builtin-browser: browser host failed to start: ${String(error)}`))
     })
     this.child.on('exit', (code, signal) => {
-      this.fail(new Error(`dsh-builtin-browser: browser host exited (code=${String(code)} signal=${String(signal)})`))
+      // The exit code/signal is the other half of a crash report; without it a
+      // restart loop is indistinguishable from a clean stop.
+      const line = `browser host exited (code=${String(code)} signal=${String(signal)})`
+      appendHostLog(`${line}\n`)
+      this.fail(new Error(`dsh-builtin-browser: ${line}`))
     })
   }
 
@@ -869,6 +884,39 @@ export class RemoteElectronViewHost implements ElectronBrowserViewHost {
       .catch(() => { /* host unavailable */ })
   }
 
+  /**
+   * (Re)present a view and WAIT for the child to confirm it, so the provider
+   * can dispatch CDP `Input.*` knowing the view has a display surface.
+   *
+   * Two things this fixes, both silent before:
+   *  - showing a view that does not exist yet is a no-op in the child, so the
+   *    view must be materialized first (a fresh tab's createView races the
+   *    provider's showActive);
+   *  - a view whose renderer was replaced by a navigation is \"already\n   *    visible\" and therefore skipped by the child's flicker-avoidance fast
+   *    path, leaving the new renderer without a surface.
+   *
+   * The barrier ping is meaningful because the child handles messages strictly
+   * in order: its reply is queued behind the showView and so only arrives once
+   * the visibility change has been applied.
+   */
+  async presentView(handle: ElectronViewHandle, label?: string): Promise<void> {
+    await this.ready()
+    const client = this.client
+    if (client === undefined) throw new HostGoneError('browser host unavailable')
+    // A view created after the last createView does not exist in the child yet.
+    // ensureMaterialized also rebuilds it against a fresh child after a host
+    // death, which is the path that used to leave sessions timing out forever.
+    if (handle instanceof DeferredRemoteView) {
+      await withTimeout(handle.ensureMaterialized(), PRESENT_TIMEOUT_MS, 'browser host did not materialize the view')
+    }
+    await withTimeout(
+      client.call('showView', { viewId: handle.id, ...label !== undefined ? { label } : {} }),
+      PRESENT_TIMEOUT_MS,
+      'browser host did not confirm the view presentation',
+    )
+    await withTimeout(client.call('ping'), PRESENT_TIMEOUT_MS, 'browser host stopped answering')
+  }
+
   /** Route a view into its session's own window (one window per session). */
   groupView(handle: ElectronViewHandle, windowId: string, label?: string): void {
     this.groups.set(handle.id, { windowId, ...label !== undefined ? { label } : {} })
@@ -986,6 +1034,33 @@ class DeferredRemoteView implements ElectronViewHandle {
   async restoreAuth(cookies: ExportedCookie[]): Promise<number> {
     return this.withRecovery(view => view.restoreAuth(cookies))
   }
+
+  /** Materialize this view in the child (no-op when already there). */
+  async ensureMaterialized(): Promise<void> {
+    await this.withRecovery(async () => undefined)
+  }
+}
+
+/**
+ * Append one host-diagnostics chunk to `$DSH_HOME/logs/dsh-builtin-browser-host.log`.
+ * Best-effort and self-limiting: diagnostics must never break the host or grow
+ * without bound, so failures are swallowed and the file is truncated when it
+ * gets large (a crash loop writes quickly).
+ */
+const HOST_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+function appendHostLog(text: string): void {
+  const home = process.env.DSH_HOME
+  if (home === undefined || home === '') return
+  try {
+    const dir = join(home, 'logs')
+    const file = join(dir, 'dsh-builtin-browser-host.log')
+    try {
+      if (statSync(file).size > HOST_LOG_MAX_BYTES) writeFileSync(file, '')
+    } catch { /* first write, or unreadable: just append */ }
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(file, text)
+  } catch { /* diagnostics are best-effort only */ }
 }
 
 /** Reject a promise if it does not settle within the budget. */

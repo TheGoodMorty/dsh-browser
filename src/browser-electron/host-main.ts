@@ -34,6 +34,7 @@ import { dirname, join } from 'node:path'
  * The spawn token the parent sent via stdin (first line). Must be echoed in
  * our hello. Read from stdin so the token never appears in argv (WMI /
  * Process Explorer / /proc/*).
+ */
 
 // Isolate this host's profile from the DSH app's default Electron userData:
 // several Electron instances sharing Roaming\Electron fight over the GPU
@@ -85,6 +86,14 @@ const TOOLBAR_HEIGHT = 64
 /** One view: the Electron object plus its CDP-backed surface. */
 interface HostView {
   readonly webContentsView: WebContentsView
+  /**
+   * Set when the view's renderer process was replaced by a navigation. The
+   * fresh renderer has no display surface, and Chromium silently drops CDP
+   * synthesized input for a view without one — so the next show/input must
+   * force the visible-again dance even if this view is already the visible
+   * one. Cleared once the surface has been re-established.
+   */
+  needsRepresent: boolean
 }
 
 /** One window: a session's views + its toolbar. */
@@ -176,7 +185,17 @@ button.tool:hover { background: rgba(255,255,255,.12); }
   <div class="strip" id="strip"></div>
   <div id="err"></div>
 <script>
-const bridge = window.bridge
+// The body runs inside an IIFE on purpose. The preload above exposes
+// window.bridge via contextBridge.exposeInMainWorld(), which installs a
+// NON-CONFIGURABLE global property. A top-level const/let named bridge here
+// would hit HasRestrictedGlobalProperty and throw a SyntaxError at PARSE time
+// — an early error, so the whole script is discarded: nothing gets bound, the
+// address bar and nav buttons go silently dead, and the user sees no error.
+// Function scope sidesteps that check (the tb name below stops the collision
+// from returning by habit) and keeps these bindings off the page global.
+// Keep this block free of backticks — it lives inside a TS template literal.
+(() => {
+const tb = window.bridge
 const addr = document.getElementById('addr')
 const strip = document.getElementById('strip')
 const errBox = document.getElementById('err')
@@ -187,7 +206,7 @@ function showErr(text) {
   clearTimeout(showErrT)
   showErrT = setTimeout(() => errBox.classList.remove('show'), 5000)
 }
-function post(action, payload) { bridge.post(action, payload || {}) }
+function post(action, payload) { tb.post(action, payload || {}) }
 document.getElementById('back').onclick = () => post('back')
 document.getElementById('fwd').onclick = () => post('forward')
 document.getElementById('reload').onclick = () => post('reload')
@@ -202,7 +221,7 @@ addr.addEventListener('keydown', e => {
     if (v !== '') { post('navigate', { url: v }); addr.blur() }
   }
 })
-bridge.onTabs(payload => {
+tb.onTabs(payload => {
   const tabs = (payload && payload.tabs) || []
   strip.textContent = ''
   for (const t of tabs) {
@@ -224,7 +243,8 @@ bridge.onTabs(payload => {
   const act = tabs.find(t => t.active)
   if (act && document.activeElement !== addr) addr.value = act.url || ''
 })
-bridge.onError(text => showErr(text))
+tb.onError(text => showErr(text))
+})()
 </script>
 </body>
 </html>
@@ -241,6 +261,48 @@ function ensureToolbarFiles(): void {
   mkdirSync(TOOLBAR_DIR, { recursive: true })
   writeFileSync(join(TOOLBAR_DIR, 'preload.js'), TOOLBAR_PRELOAD)
   writeFileSync(join(TOOLBAR_DIR, 'toolbar.html'), TOOLBAR_HTML)
+}
+
+/**
+ * Bound an await with a timeout. Used so a wedged renderer surfaces as an
+ * explicit error instead of a command that never settles.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`))
+    }, ms)
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+/**
+ * CDP commands are bounded here as well as in the parent: a view whose
+ * renderer stopped responding must produce a clear error, not a hang that
+ * only the tool layer's 10–30s timeout eventually cuts off.
+ */
+const COMMAND_TIMEOUT_MS = 20000
+
+/**
+ * A brand-new WebContentsView has no renderer process until something loads,
+ * and CDP commands (Runtime.evaluate …) sent to a renderer-less view never
+ * settle. That is what made a host restart unrecoverable: the provider
+ * rebuilds the session with a fresh blank view whose very first action is a
+ * location.href read, which hung until the tool timeout.
+ *
+ * Loading about:blank spawns the renderer, so the view answers the moment it
+ * exists; a real navigation replaces it right after. Bounded + best-effort —
+ * the caller still gets its reply if this fails.
+ */
+const RENDERER_PRIME_TIMEOUT_MS = 3000
+
+async function primeRenderer(view: WebContentsView): Promise<void> {
+  try {
+    await withTimeout(view.webContents.loadURL('about:blank'), RENDERER_PRIME_TIMEOUT_MS, 'renderer prime')
+  } catch { /* best effort: the first real navigation creates the renderer */ }
 }
 
 /** Reply to the parent over the RPC socket. */
@@ -449,7 +511,16 @@ function updateWindowTitle(win: HostWindow, viewId: string | undefined, label: s
 function showViewInWindow(win: HostWindow, viewId: string, label?: string): void {
   const entry = win.views.get(viewId)
   if (entry === undefined) return
-  if (win.visibleViewId !== viewId) {
+  // A navigation replaced this view's renderer, and the new one has no
+  // display surface yet. Chromium drops CDP synthesized input (Input.*) for a
+  // view without a surface, which silently swallowed the FIRST click/keystroke
+  // after every navigation — and because the view was already the visible one,
+  // the dance below used to be skipped entirely. Force it once.
+  const mustRepresent = entry.needsRepresent
+  if (mustRepresent) {
+    try { entry.webContentsView.setVisible(false) } catch { /* destroyed */ }
+  }
+  if (win.visibleViewId !== viewId || mustRepresent) {
     // Hide every other view in THIS window, then show and RAISE the target
     // (topmost child wins). When the target is already visible, skip the
     // remove/re-add dance — doing it on every operation flickered.
@@ -463,6 +534,7 @@ function showViewInWindow(win: HostWindow, viewId: string, label?: string): void
       win.window.contentView.addChildView(entry.webContentsView)
     } catch { /* window closing */ }
     win.visibleViewId = viewId
+    entry.needsRepresent = false
     syncToolbar(win)
   }
   // Always refresh the title: it reflects the CURRENT page of the visible
@@ -549,11 +621,18 @@ async function handle(op: string, msg: { id: number; viewId?: string; windowId?:
         // New views start hidden: only the shown one may be visible.
         view.setVisible(false)
         win.window.contentView.addChildView(view)
-        win.views.set(viewId, { webContentsView: view })
+        win.views.set(viewId, { webContentsView: view, needsRepresent: false })
         // Keep the window title and the toolbar tab strip live as the page
         // changes (navigations, title updates).
         view.webContents.on('page-title-updated', () => { updateWindowTitle(win, viewId, undefined); syncToolbar(win) })
-        view.webContents.on('did-navigate', () => { updateWindowTitle(win, viewId, undefined); syncToolbar(win) })
+        view.webContents.on('did-navigate', () => {
+          // The renderer process was just replaced: mark the view so the next
+          // show forces a fresh display surface (see showViewInWindow).
+          const current = win.views.get(viewId)
+          if (current !== undefined) current.needsRepresent = true
+          updateWindowTitle(win, viewId, undefined)
+          syncToolbar(win)
+        })
         view.webContents.on('did-navigate-in-page', () => syncToolbar(win))
         wireFocusRouting(win, view, viewId)
         const first = win.views.size === 1
@@ -564,6 +643,10 @@ async function handle(op: string, msg: { id: number; viewId?: string; windowId?:
         layoutWindow(win)
         if (first) updateWindowTitle(win, viewId, undefined)
         syncToolbar(win)
+        // Prime the renderer BEFORE replying: the parent's next command
+        // (a location.href read) would otherwise hang on a view that has no
+        // renderer yet — the root of "host restarted and never recovers".
+        await primeRenderer(view)
         reply(msg.id, { ok: true })
         return
       }
@@ -623,7 +706,11 @@ async function handle(op: string, msg: { id: number; viewId?: string; windowId?:
         if (win === undefined || entry === undefined) throw new Error(`command: unknown view ${viewId}`)
         const method = msg.method
         if (typeof method !== 'string') throw new Error('command missing method')
-        const result = await entry.webContentsView.webContents.debugger.sendCommand(method, msg.params ?? {})
+        const result = await withTimeout(
+          entry.webContentsView.webContents.debugger.sendCommand(method, msg.params ?? {}),
+          COMMAND_TIMEOUT_MS,
+          `CDP ${method}`,
+        )
         reply(msg.id, { ok: true, result })
         return
       }
@@ -894,6 +981,13 @@ void app.whenReady().then(() => {
     }
   }
   const rl = createInterface({ input: socket })
+  // Handle messages STRICTLY in order. Ops depend on each other completing:
+  // a `command` for a view must not overtake the `createView` that makes it,
+  // and the parent's present-barrier (`showView` then `ping`) is only
+  // meaningful if the child cannot answer the ping mid-show. The previous
+  // fire-and-forget loop let all of them race, which is how a fresh tab's
+  // first click could be dispatched before its view was ever on screen.
+  let queue: Promise<void> = Promise.resolve()
   rl.on('line', line => {
     const text = line.trim()
     if (text === '') return
@@ -904,7 +998,10 @@ void app.whenReady().then(() => {
       return // non-protocol noise
     }
     if (typeof msg.id !== 'number' || typeof msg.op !== 'string') return
-    void handle(msg.op, msg).catch(() => { /* reply already sent inside handle */ })
+    // Bind the narrowed op now: the check above does not survive into the
+    // deferred callback (msg is a mutable binding).
+    const op = msg.op
+    queue = queue.then(() => handle(op, msg)).catch(() => { /* reply already sent inside handle */ })
   })
   socket.on('error', error => {
     process.stderr.write(`[dsh-browser host] socket error: ${String(error)}\n`)

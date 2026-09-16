@@ -132,6 +132,22 @@ export declare class RemoteElectronViewHost implements ElectronBrowserViewHost {
     createView(): ElectronViewHandle;
     private ensureView;
     showView(handle: ElectronViewHandle, label?: string): void;
+    /**
+     * (Re)present a view and WAIT for the child to confirm it, so the provider
+     * can dispatch CDP `Input.*` knowing the view has a display surface.
+     *
+     * Two things this fixes, both silent before:
+     *  - showing a view that does not exist yet is a no-op in the child, so the
+     *    view must be materialized first (a fresh tab's createView races the
+     *    provider's showActive);
+     *  - a view whose renderer was replaced by a navigation is \"already\n   *    visible\" and therefore skipped by the child's flicker-avoidance fast
+     *    path, leaving the new renderer without a surface.
+     *
+     * The barrier ping is meaningful because the child handles messages strictly
+     * in order: its reply is queued behind the showView and so only arrives once
+     * the visibility change has been applied.
+     */
+    presentView(handle: ElectronViewHandle, label?: string): Promise<void>;
     /** Route a view into its session's own window (one window per session). */
     groupView(handle: ElectronViewHandle, windowId: string, label?: string): void;
     /** Register the provider's handler for user-initiated toolbar actions. */

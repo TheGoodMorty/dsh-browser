@@ -71,6 +71,7 @@ function makeHost(overrides = {}) {
     onUserAction(handler) { userActionHandler = handler },
     userAction(action) { userActionHandler?.(action) },
     ...(overrides.available !== undefined ? { available: overrides.available } : {}),
+    ...(overrides.presentView !== undefined ? { presentView: overrides.presentView } : {}),
   }
   return host
 }
@@ -314,6 +315,63 @@ test('user actions from the host UI route into the session model', async () => {
   host.userAction({ type: 'navigate', windowId: 'browser:nope', url: 'https://x.example/' })
   await new Promise(r => setTimeout(r, 20))
   await p.close(sid)
+})
+
+// Issue #10 (defect 1): Page.navigate resolves at navigation COMMIT, so a
+// snapshot taken right after it used to see the new title with an unparsed DOM
+// and no interactive elements.
+test('navigate waits for the new document to be parsed before returning', async () => {
+  const probes = []
+  const host = makeHost({
+    evaluate: (method, params) => {
+      const expr = params.expression || ''
+      if (!expr.includes('performance.timeOrigin')) return { result: { value: { ok: true } } }
+      probes.push(1)
+      // Probe 1 is the pre-navigation read (the OLD document). From probe 2 on,
+      // the committed document is current but still parsing — the exact window
+      // that used to produce a correct title with zero interactive elements.
+      const n = probes.length
+      if (n === 1) return { result: { value: '100|complete' } }
+      if (n <= 3) return { result: { value: '200|loading' } }
+      return { result: { value: '200|interactive' } }
+    },
+  })
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.navigate(sid, { url: 'https://fresh.example/' })
+  assert.equal(probes.length >= 4, true,
+    `navigate returned without waiting for the parse (probes: ${probes.length})`)
+  await p.close(sid)
+})
+
+// Issue #10 (defect 2): Input.* is silently dropped by Chromium for a view
+// without a display surface, so click/type/key must present the view first —
+// and fail loudly when it cannot be presented.
+test('click presents the view before dispatching input, and reports failure', async () => {
+  const order = []
+  const host = makeHost({
+    presentView: async () => { order.push('present') },
+  })
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  const handle = host.views.values().next().value
+  const base = handle.sendCommand
+  handle.sendCommand = async (method, params) => {
+    if (method === 'Input.dispatchMouseEvent') order.push(`input:${params.type}`)
+    if (method === 'Runtime.evaluate' && String(params.expression).includes('elementFromPoint')) return { result: { value: { ok: true, x: 5, y: 6 } } }
+    return base(method, params)
+  }
+  await p.click(sid, { x: 5, y: 6 })
+  assert.deepEqual(order[0], 'present', `input was dispatched before the view was presented (${order.join(', ')})`)
+  assert.equal(order.includes('present'), true)
+  await p.close(sid)
+
+  // A host that cannot present must surface the real reason, not a fake success.
+  const failing = makeHost({ presentView: async () => { throw new Error('no surface') } })
+  const p2 = new ElectronBrowserProvider(failing)
+  const sid2 = await p2.open()
+  await assert.rejects(() => p2.click(sid2, { x: 1, y: 1 }), /not presented|BROWSER_VIEW_NOT_PRESENTED|no surface/)
+  await p2.close(sid2)
 })
 
 test('reload issues Page.reload and records history', async () => {
