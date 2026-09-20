@@ -657,6 +657,11 @@ class RemoteView implements ElectronViewHandle {
     })
   }
 
+  /** Give this view web focus in the child, so keyboard input reaches the page. */
+  focus(): Promise<void> {
+    return this.client.call<void>('focus', { viewId: this.id })
+  }
+
   /** Ask the child to download a URL to a local file (keeps cookies/login). */
   async download(url: string, savePath: string): Promise<void> {
     // The child writes the file itself (temp + rename); only a small
@@ -682,6 +687,15 @@ class RemoteView implements ElectronViewHandle {
 }
 
 /**
+ * How long a FAILED Electron-binary probe is remembered before the binary
+ * search runs again (`available()`). A success is kept for the host's lifetime.
+ */
+const PROBE_RETRY_MS = (() => {
+  const raw = Number(process.env.DSH_BROWSER_PROBE_RETRY_MS)
+  return Number.isFinite(raw) && raw >= 0 ? raw : 30000
+})()
+
+/**
  * Self-hosted view host: spawns the plugin's Electron child on first use and
  * keeps it alive until dispose(). Fallback when no desktop shell provides
  * ctx.electronViewHost.
@@ -693,8 +707,11 @@ export class RemoteElectronViewHost implements ElectronBrowserViewHost {
   private readonly views = new Map<string, ElectronViewHandle>()
   private readyPromise: Promise<void> | undefined
   private disposed = false
-  /** Cached probe result so `available()` stays cheap after the first call. */
+  /** Last probe result. A success is kept for the host's lifetime; a failure
+   *  is retried after `PROBE_RETRY_MS` (see `available()`). */
   private electronAvailable: boolean | undefined
+  /** Earliest time the next probe may run after a negative one. */
+  private nextProbeAt = 0
   /** Window groups (windowId per view), re-sent on every materialization so
    *  a restarted child still places views in the right windows. */
   private readonly groups = new Map<string, { windowId: string; label?: string }>()
@@ -706,27 +723,37 @@ export class RemoteElectronViewHost implements ElectronBrowserViewHost {
     /** Test seam: the executable to spawn instead of the resolved Electron
      *  binary. Absent -> resolveElectronPath() (production behavior). */
     private readonly spawnExecutable?: string,
+    /** Test seam: the binary probe behind `available()`. Absent ->
+     *  resolveElectronPath(). */
+    private readonly probe: () => void = resolveElectronPath,
   ) {}
 
   /**
    * Cheap usability probe: can we find an Electron binary to spawn? The scan
-   * is filesystem-only (no network), per the seam's contract, and the result
-   * is cached for the host's lifetime — a missing binary surfaces as
-   * `BROWSER_PROVIDER_UNAVAILABLE` at provider selection instead of a
-   * confusing spawn failure on first use.
+   * is filesystem-only (no network), per the seam's contract, so a missing
+   * binary surfaces as `BROWSER_PROVIDER_UNAVAILABLE` at provider selection
+   * instead of a confusing spawn failure on first use.
+   *
+   * A success is cached for the host's lifetime. A failure is NOT: an install
+   * (`npm i electron`, or the postinstall that fetches the binary) can land
+   * long after DSH started, and provider selection happens once per process —
+   * caching "no" permanently reported "no usable browser provider is
+   * registered" until DSH restarted, with no way back short of that. Retrying
+   * on a cooldown heals it by itself while keeping the scan off the hot path.
    */
   available(): boolean {
-    if (this.electronAvailable === undefined) {
-      try {
-        resolveElectronPath()
-        this.electronAvailable = true
-      } catch (error) {
-        this.electronAvailable = false
-        // The provider will be reported unavailable, so the detailed
-        // resolution error (install-electron / ELECTRON_PATH guidance) would
-        // otherwise never reach the user — surface it on stderr.
-        process.stderr.write(`[dsh-browser host] electron unavailable: ${error instanceof Error ? error.message : String(error)}\n`)
-      }
+    if (this.electronAvailable === true) return true
+    if (Date.now() < this.nextProbeAt) return false
+    this.nextProbeAt = Date.now() + PROBE_RETRY_MS
+    try {
+      this.probe()
+      this.electronAvailable = true
+    } catch (error) {
+      this.electronAvailable = false
+      // The provider will be reported unavailable, so the detailed
+      // resolution error (install-electron / ELECTRON_PATH guidance) would
+      // otherwise never reach the user — surface it on stderr.
+      process.stderr.write(`[dsh-browser host] electron unavailable: ${error instanceof Error ? error.message : String(error)}\n`)
     }
     return this.electronAvailable
   }
@@ -1025,6 +1052,10 @@ class DeferredRemoteView implements ElectronViewHandle {
 
   async capture(opts?: ScreenshotOptions): Promise<{ base64: string; mime: string }> {
     return this.withRecovery(view => view.capture(opts))
+  }
+
+  async focus(): Promise<void> {
+    return this.withRecovery(view => view.focus())
   }
 
   async flushAuth(): Promise<ExportedCookie[]> {

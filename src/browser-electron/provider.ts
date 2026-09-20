@@ -207,6 +207,12 @@ export interface ElectronViewHandle {
    * @returns the CDP `result` object.
    */
   sendCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>
+  /**
+   * Give the backing view web focus so keyboard input reaches its page.
+   * Optional: an adapter that cannot focus a view omits it, and the provider
+   * then behaves exactly as before.
+   */
+  focus?(): Promise<void>
 }
 
 /** One tab inside a session: its view plus a stable id. */
@@ -254,14 +260,16 @@ export interface CdpNavigateParams {
 }
 
 /**
- * CDP method/params for `Input.dispatchMouseEvent` (a click press+release pair).
+ * CDP method/params for `Input.dispatchMouseEvent`: a pointer move, or one half
+ * of a click's press+release pair. `button`/`clickCount` belong to the press and
+ * release halves; a move carries only the position.
  */
 export interface CdpMouseParams {
-  readonly type: 'mousePressed' | 'mouseReleased'
+  readonly type: 'mouseMoved' | 'mousePressed' | 'mouseReleased'
   readonly x: number
   readonly y: number
-  readonly button: 'left'
-  readonly clickCount: number
+  readonly button?: 'left'
+  readonly clickCount?: number
 }
 
 /** CDP method/params for `Input.insertText`. */
@@ -661,6 +669,26 @@ export class ElectronBrowserProvider implements BrowserProvider {
         'BROWSER_VIEW_NOT_PRESENTED',
         { cause: error },
       )
+    }
+  }
+
+  /**
+   * Give the view web focus before synthesizing keyboard input.
+   *
+   * A renderer only delivers key events to the view that holds web focus. A
+   * view that was created but never clicked holds none — and `Input` events
+   * injected over CDP do not grant it — so the FIRST `browser_key` of a fresh
+   * session vanished inside the renderer while the command still answered
+   * success. Hosts that cannot focus a view (a test double, a different shell
+   * adapter) simply have no `focus`, and nothing changes for them.
+   */
+  private async focusView(handle: ElectronViewHandle): Promise<void> {
+    if (handle.focus === undefined) return
+    try {
+      await handle.focus()
+    } catch {
+      // Best-effort: a view that refuses focus must not fail the caller's key
+      // press; the dispatch below reports a real channel failure itself.
     }
   }
 
@@ -1196,23 +1224,51 @@ export class ElectronBrowserProvider implements BrowserProvider {
     // Input.* is only delivered to a view with a current display surface; the
     // barrier also re-presents after a navigation replaced the renderer.
     await this.present(s, signal)
-    const press = (type: 'mousePressed' | 'mouseReleased'): Promise<Record<string, unknown>> =>
-      handle.sendCommand('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 } satisfies CdpMouseParams)
     const timeoutMs = 30_000
+    const send = (params: Record<string, unknown>, label: string): Promise<unknown> =>
+      withTimeout(
+        handle.sendCommand('Input.dispatchMouseEvent', params),
+        timeoutMs,
+        signal,
+        `browser: click ${label} timed out after ${timeoutMs}ms`,
+      )
+    // Chromium routes a synthesized `mousePressed` to the widget's *current*
+    // hover target rather than hit-testing the coordinates, and a real pointer
+    // click is always preceded by movement. A view that has never received a
+    // mouse event has no hover target yet, so the press of the FIRST click on a
+    // fresh tab went nowhere while CDP still answered success; the second click
+    // landed because the first had quietly established the target. Move the
+    // pointer first so a click is self-contained.
     try {
-      await withTimeout(press('mousePressed'), timeoutMs, signal, `browser: click press timed out after ${timeoutMs}ms`)
+      await send({ type: 'mouseMoved', x, y } satisfies CdpMouseParams, 'move')
+    } catch (error) {
+      throw new BrowserError(`browser: click failed: ${String(error)}`, 'BROWSER_CLICK_FAILED', { cause: error })
+    }
+    const release = (): void => {
+      void handle
+        .sendCommand('Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x,
+          y,
+          button: 'left',
+          clickCount: 1,
+        } satisfies CdpMouseParams)
+        .catch(() => {})
+    }
+    try {
+      await send({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, 'press')
     } catch (error) {
       // The press may still land late; release best-effort so the button is
       // never left in a stuck pressed state.
-      void press('mouseReleased').catch(() => {})
+      release()
       throw new BrowserError(`browser: click failed: ${String(error)}`, 'BROWSER_CLICK_FAILED', { cause: error })
     }
     try {
-      await withTimeout(press('mouseReleased'), timeoutMs, signal, `browser: click release timed out after ${timeoutMs}ms`)
+      await send({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, 'release')
     } catch (error) {
       // The press already landed; retry the release so the button is not
       // left pressed before surfacing the failure.
-      void press('mouseReleased').catch(() => {})
+      release()
       throw new BrowserError(`browser: click failed: ${String(error)}`, 'BROWSER_CLICK_FAILED', { cause: error })
     }
     this.record(s, 'click', 'target' in request ? { target: request.target } : { x, y }, true)
@@ -1375,6 +1431,7 @@ export class ElectronBrowserProvider implements BrowserProvider {
     const timeoutMs = 15_000
     // Input.dispatchKeyEvent is subject to the same display-surface rule.
     await this.present(s, signal)
+    await this.focusView(handle)
     const release = (): Promise<Record<string, unknown>> =>
       handle.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', ...params })
     try {

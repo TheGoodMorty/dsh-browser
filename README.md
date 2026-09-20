@@ -310,6 +310,7 @@ npm run build
 | 第十七轮 | 2026-09-16 | **截图 savePath 收敛 + 下载目录本地化**(issue #13):`browser_screenshot` 原先直接 `writeFileSync`,可写进程可达的任意路径并**静默覆盖**已有文件(等于绕过只读沙箱的写保护)→ 抽出唯一下载/截图共用准入门 `admitSavePath`(绝对路径 + `downloadDir` 内 + **不覆盖已存在文件**),截图补父目录自动创建;默认下载目录不再写死 `~/Downloads`,按序探测 `downloadDir` → `XDG_DOWNLOAD_DIR` → `~/Downloads`/`~/下载`/`~/下載` → 回退(中文桌面免配置) |
 
 | **0.1.22** | 2026-09-16 | **发布**:macOS 二进制探测修复(issue #9 / #14)与第十五~十七轮(issue #11 工具栏 SyntaxError / #10 自托管三连 / #13 截图 savePath + 下载目录)随 **0.1.22** 收录(构建零错误、**35 项测试全绿**,tag `v0.1.22`) |
+| 第十八轮 | 2026-09-20 | **Windows 真机三连 + 探测自愈**(真实 `dsh web` 自托管宿主实测,四个缺陷同为「CDP 报成功、页面没收到」):① Windows 的 `CalculateNativeWinOcclusion` 把被遮挡的插件窗口判定为 HIDDEN → 整站停帧,且每条合成鼠标/键盘事件被渲染端静默丢弃(CanReceiveInput=false)而 CDP 回 `{}` → 子进程 ready 前追加 `disable-features=CalculateNativeWinOcclusion`(仅 win32);② `click()` 缺前置 `mouseMoved`,新视图第一次点击落空 → 改为 move→press→release;③ 新视图从未持有 web focus,`browser_key` 第一次调用无效 → 宿主新增 `focus` op(view handle 可选 `focus?()`),`key()` 派发前 best-effort 聚焦,并在焦点需要移动时等 80ms(焦点落地异步,同轮派发的键仍会被丢);④ `available()` 把**失败**探测按宿主生命周期永久缓存,而 provider 选择每进程一次 → Electron 晚于 DSH 到位就永远接不上 → 成功仍缓存、失败 30s 冷却后重探(`DSH_BROWSER_PROBE_RETRY_MS`),`resolveProvider()` 报错区分「一个都没注册」与「注册了但自报不可用」并附处置;新增 4 条回归测试(**44/44 全绿**),真实宿主端到端 **17/17** |
 
 > registry 上的最新版本以顶部 npm 徽章为准:本次 `0.1.22` 已入库并打 tag;若徽章仍显示 `0.1.21`,说明该版本尚未 publish。
 

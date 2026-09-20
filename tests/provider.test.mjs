@@ -16,13 +16,15 @@ function makeHost(overrides = {}) {
   const views = new Map()
   const showCalls = []
   const groupCalls = []
-  const events = { terminate: 0, release: 0, keyDown: 0, keyUp: 0, navigateHistory: 0, reload: 0, history: { entries: [], currentIndex: -1 }, insertText: '', keyDownParams: null }
+  const events = { terminate: 0, move: 0, press: 0, release: 0, keyDown: 0, keyUp: 0, focus: 0, order: [], navigateHistory: 0, reload: 0, history: { entries: [], currentIndex: -1 }, insertText: '', keyDownParams: null }
+  const mouseSequence = []
   const page = { url: 'about:blank', wait: { urlOk: true, loadedOk: true, foundOk: true } }
   let userActionHandler = null
   const host = {
     views,
     showCalls,
     groupCalls,
+    mouseSequence,
     events,
     page,
     createView() {
@@ -34,15 +36,17 @@ function makeHost(overrides = {}) {
           if (method === 'Page.navigate') { url = params.url; return {} }
           if (method === 'Page.reload') { events.reload++; return {} }
           if (method === 'Input.dispatchMouseEvent') {
-            if (params.type === 'mousePressed') return {}
+            mouseSequence.push(params.type)
+            if (params.type === 'mouseMoved') { events.move++; return {} }
+            if (params.type === 'mousePressed') { events.press++; return {} }
             events.release++
             if (events.release === 1 && overrides.failFirstRelease) throw new Error('release fails')
             return {}
           }
           if (method === 'Input.insertText') { events.insertText = params.text; return {} }
           if (method === 'Input.dispatchKeyEvent') {
-            if (params.type === 'keyDown') { events.keyDown++; events.keyDownParams = params }
-            if (params.type === 'keyUp') events.keyUp++
+            if (params.type === 'keyDown') { events.keyDown++; events.keyDownParams = params; events.order.push('keyDown') }
+            if (params.type === 'keyUp') { events.keyUp++; events.order.push('keyUp') }
             return {}
           }
           if (method === 'Page.getNavigationHistory') return { entries: events.history.entries, currentIndex: events.history.currentIndex }
@@ -62,6 +66,9 @@ function makeHost(overrides = {}) {
         },
         download: overrides.download ?? (async () => {}),
         ...(overrides.capture !== undefined ? { capture: overrides.capture } : {}),
+        // Keyboard input only reaches a page whose view holds web focus; a
+        // host that cannot focus a view at all omits the method (`noFocus`).
+        ...(overrides.noFocus ? {} : { focus: async () => { events.focus++; events.order.push('focus') } }),
       }
       views.set(id, handle)
       return handle
@@ -201,6 +208,20 @@ test('hung execute times out and interrupts the page', async () => {
   await p.close(sid)
 })
 
+test('click moves the pointer before pressing, so the first click lands', async () => {
+  // Chromium routes a synthesized mousePressed to the widget's current hover
+  // target instead of hit-testing it: without a preceding mouseMoved the press
+  // of the FIRST click on a fresh view is dropped by the renderer while CDP
+  // still reports success.
+  const host = makeHost()
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.click(sid, { x: 5, y: 5 })
+  assert.deepEqual(host.mouseSequence, ['mouseMoved', 'mousePressed', 'mouseReleased'])
+  assert.equal(host.events.move, 1)
+  await p.close(sid)
+})
+
 test('click retries release after a failure (no stuck button)', async () => {
   const host = makeHost({ failFirstRelease: true })
   const p = new ElectronBrowserProvider(host)
@@ -232,6 +253,40 @@ test('key Space carries CDP text so a focused input receives the character', asy
   // Enter has no printable text; the keyDown must not carry a stray text.
   await p.key(sid, { key: 'Enter' })
   assert.equal(host.events.keyDownParams.text, undefined)
+  await p.close(sid)
+})
+
+test('key focuses the view first, so the first key of a fresh session is not dropped', async () => {
+  const host = makeHost()
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.key(sid, { key: 'Enter' })
+  // A renderer drops injected keys unless the view holds web focus, so focus
+  // has to happen before the keyDown — not after, and not never.
+  assert.deepEqual(host.events.order, ['focus', 'keyDown', 'keyUp'])
+  assert.equal(host.events.focus, 1)
+  await p.close(sid)
+})
+
+test('key still dispatches when the host cannot focus a view', async () => {
+  const host = makeHost({ noFocus: true })
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.key(sid, { key: 'Escape' })
+  assert.equal(host.events.focus, 0)
+  assert.deepEqual(host.events.order, ['keyDown', 'keyUp'])
+  await p.close(sid)
+})
+
+test('key survives a view that refuses focus', async () => {
+  const host = makeHost()
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  const handle = [...host.views.values()][0]
+  handle.focus = async () => { throw new Error('focus denied') }
+  await p.key(sid, { key: 'Enter' })
+  assert.equal(host.events.keyDown, 1, 'a failed focus must not swallow the key')
+  assert.deepEqual(host.events.order, ['keyDown', 'keyUp'])
   await p.close(sid)
 })
 

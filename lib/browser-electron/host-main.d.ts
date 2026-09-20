@@ -13,6 +13,7 @@
  *      { id, op: 'destroyView', viewId } | { id, op: 'showView', viewId } |
  *      { id, op: 'groupView', viewId, windowId, label? } |
  *      { id, op: 'command', viewId, method, params } |
+ *      { id, op: 'focus', viewId } |
  *      { id, op: 'userActionError', windowId, message }
  *   -> { id: 0, op: 'hello', token } (our FIRST message — proves we know the
  *      parent's stdin token; the parent refuses the connection otherwise)

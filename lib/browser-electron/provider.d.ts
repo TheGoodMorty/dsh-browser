@@ -126,6 +126,12 @@ export interface ElectronViewHandle {
      * @returns the CDP `result` object.
      */
     sendCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /**
+     * Give the backing view web focus so keyboard input reaches its page.
+     * Optional: an adapter that cannot focus a view omits it, and the provider
+     * then behaves exactly as before.
+     */
+    focus?(): Promise<void>;
 }
 /** Provider config: navigation admission defaults and snapshot caps. */
 export interface ElectronBrowserProviderConfig {
@@ -151,14 +157,16 @@ export interface CdpNavigateParams {
     readonly url: string;
 }
 /**
- * CDP method/params for `Input.dispatchMouseEvent` (a click press+release pair).
+ * CDP method/params for `Input.dispatchMouseEvent`: a pointer move, or one half
+ * of a click's press+release pair. `button`/`clickCount` belong to the press and
+ * release halves; a move carries only the position.
  */
 export interface CdpMouseParams {
-    readonly type: 'mousePressed' | 'mouseReleased';
+    readonly type: 'mouseMoved' | 'mousePressed' | 'mouseReleased';
     readonly x: number;
     readonly y: number;
-    readonly button: 'left';
-    readonly clickCount: number;
+    readonly button?: 'left';
+    readonly clickCount?: number;
 }
 /** CDP method/params for `Input.insertText`. */
 export interface CdpInsertTextParams {
@@ -278,6 +286,17 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
      * rather than reporting a success the page never saw.
      */
     private present;
+    /**
+     * Give the view web focus before synthesizing keyboard input.
+     *
+     * A renderer only delivers key events to the view that holds web focus. A
+     * view that was created but never clicked holds none — and `Input` events
+     * injected over CDP do not grant it — so the FIRST `browser_key` of a fresh
+     * session vanished inside the renderer while the command still answered
+     * success. Hosts that cannot focus a view (a test double, a different shell
+     * adapter) simply have no `focus`, and nothing changes for them.
+     */
+    private focusView;
     /** Execute JS in the active tab's page context. */
     execute(session: BrowserSessionId, request: BrowserExecuteRequest, signal?: AbortSignal): Promise<BrowserExecuteResult>;
     /**

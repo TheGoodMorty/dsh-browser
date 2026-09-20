@@ -99,14 +99,20 @@ export declare class RemoteElectronViewHost implements ElectronBrowserViewHost {
     /** Test seam: the executable to spawn instead of the resolved Electron
      *  binary. Absent -> resolveElectronPath() (production behavior). */
     private readonly spawnExecutable?;
+    /** Test seam: the binary probe behind `available()`. Absent ->
+     *  resolveElectronPath(). */
+    private readonly probe;
     private client;
     private server;
     private pendingSocket;
     private readonly views;
     private readyPromise;
     private disposed;
-    /** Cached probe result so `available()` stays cheap after the first call. */
+    /** Last probe result. A success is kept for the host's lifetime; a failure
+     *  is retried after `PROBE_RETRY_MS` (see `available()`). */
     private electronAvailable;
+    /** Earliest time the next probe may run after a negative one. */
+    private nextProbeAt;
     /** Window groups (windowId per view), re-sent on every materialization so
      *  a restarted child still places views in the right windows. */
     private readonly groups;
@@ -115,13 +121,22 @@ export declare class RemoteElectronViewHost implements ElectronBrowserViewHost {
     constructor(hostMainPath: string, 
     /** Test seam: the executable to spawn instead of the resolved Electron
      *  binary. Absent -> resolveElectronPath() (production behavior). */
-    spawnExecutable?: string | undefined);
+    spawnExecutable?: string | undefined, 
+    /** Test seam: the binary probe behind `available()`. Absent ->
+     *  resolveElectronPath(). */
+    probe?: () => void);
     /**
      * Cheap usability probe: can we find an Electron binary to spawn? The scan
-     * is filesystem-only (no network), per the seam's contract, and the result
-     * is cached for the host's lifetime — a missing binary surfaces as
-     * `BROWSER_PROVIDER_UNAVAILABLE` at provider selection instead of a
-     * confusing spawn failure on first use.
+     * is filesystem-only (no network), per the seam's contract, so a missing
+     * binary surfaces as `BROWSER_PROVIDER_UNAVAILABLE` at provider selection
+     * instead of a confusing spawn failure on first use.
+     *
+     * A success is cached for the host's lifetime. A failure is NOT: an install
+     * (`npm i electron`, or the postinstall that fetches the binary) can land
+     * long after DSH started, and provider selection happens once per process —
+     * caching "no" permanently reported "no usable browser provider is
+     * registered" until DSH restarted, with no way back short of that. Retrying
+     * on a cooldown heals it by itself while keeping the scan off the hot path.
      */
     available(): boolean;
     /** Ensure the child is up and ready (lazy on first use; restarts after a crash). */

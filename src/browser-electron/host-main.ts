@@ -13,6 +13,7 @@
  *      { id, op: 'destroyView', viewId } | { id, op: 'showView', viewId } |
  *      { id, op: 'groupView', viewId, windowId, label? } |
  *      { id, op: 'command', viewId, method, params } |
+ *      { id, op: 'focus', viewId } |
  *      { id, op: 'userActionError', windowId, message }
  *   -> { id: 0, op: 'hello', token } (our FIRST message — proves we know the
  *      parent's stdin token; the parent refuses the connection otherwise)
@@ -285,6 +286,14 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * only the tool layer's 10–30s timeout eventually cuts off.
  */
 const COMMAND_TIMEOUT_MS = 20000
+
+/**
+ * How long to let a `focus` request land before answering it. Focus moves
+ * asynchronously and a key dispatched in the same turn as the request is still
+ * dropped, so the caller needs this settle — but only on the call where focus
+ * actually had to move.
+ */
+const FOCUS_SETTLE_MS = 80
 
 /**
  * A brand-new WebContentsView has no renderer process until something loads,
@@ -714,6 +723,26 @@ async function handle(op: string, msg: { id: number; viewId?: string; windowId?:
         reply(msg.id, { ok: true, result })
         return
       }
+      case 'focus': {
+        const viewId = msg.viewId
+        if (viewId === undefined) throw new Error('focus missing viewId')
+        const win = windowOfView(viewId)
+        const entry = win?.views.get(viewId)
+        if (win === undefined || entry === undefined) throw new Error(`focus: unknown view ${viewId}`)
+        // Keys go to the view that holds web focus. A view that was never
+        // clicked holds none, so the FIRST browser_key of a session was dropped
+        // by the renderer while CDP still answered the dispatch with success —
+        // and `document.hasFocus()` inside the page even read true.
+        const contents = entry.webContentsView.webContents
+        const hadWebFocus = contents.isFocused()
+        contents.focus()
+        // Focus lands asynchronously, and a key dispatched in the same turn as
+        // the request is still dropped, so hold the reply until the renderer can
+        // take input. Only on the call where focus actually had to move.
+        if (!hadWebFocus) await new Promise(resolve => setTimeout(resolve, FOCUS_SETTLE_MS))
+        reply(msg.id, { ok: true, focused: contents.isFocused() })
+        return
+      }
       case 'capture': {
         const viewId = msg.viewId
         if (viewId === undefined) throw new Error('capture missing viewId')
@@ -941,6 +970,34 @@ async function handle(op: string, msg: { id: number; viewId?: string; windowId?:
     reply(msg.id, { ok: false, err: String(error) })
   }
 }
+
+/**
+ * Chromium's native-window occlusion tracker (Windows only) asks DWM whether a
+ * window is covered by another window and, when it is, moves the WebContents to
+ * `Visibility::HIDDEN`. That is the wrong model for this host: the shared
+ * browser window normally sits *behind* whatever the human is working in, and
+ * that is exactly the state the agent drives it from. A hidden WebContents
+ * produces no frames at all (`requestAnimationFrame` never fires) and
+ * `RenderWidgetHostImpl::CanReceiveInput()` returns false, so every
+ * `Input.dispatchMouseEvent`/`dispatchKeyEvent` sent over CDP is dropped on the
+ * floor while the CDP call itself still answers `{}` — clicks and keys that
+ * silently do nothing, with no error anywhere. Keep the window's visibility
+ * state application-controlled instead; the parent already shows/raises views
+ * explicitly, and `webContentsView.setVisible()` remains the single source of
+ * truth for whether a view renders.
+ */
+function keepWindowsNonOccluding(): void {
+  if (process.platform !== 'win32') return
+  const DISABLED = 'CalculateNativeWinOcclusion'
+  const current = app.commandLine.getSwitchValue('disable-features') ?? ''
+  const features = current
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => part !== '')
+  if (!features.includes(DISABLED)) features.push(DISABLED)
+  app.commandLine.appendSwitch('disable-features', features.join(','))
+}
+keepWindowsNonOccluding()
 
 /**
  * Electron entry: connect back to the parent's RPC server (port from
