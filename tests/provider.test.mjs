@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import vm from 'node:vm'
 
 import { ElectronBrowserProvider } from '../lib/browser-electron/provider.js'
 
@@ -541,5 +542,102 @@ test('scrape extracts items through static CSS fields', async () => {
   assert.equal(r.items[1].url, null)
   assert.match(lastExpr, /div\.card/)
   assert.match(lastExpr, /a@href/)
+  await p.close(sid)
+})
+
+/**
+ * A DOM small enough to RUN the provider's in-page locate script, parsing
+ * selectors the way Chromium does: unbalanced brackets are a SyntaxError,
+ * anything else is a legal query that simply finds nothing here.
+ */
+function makeLocateContext(counts) {
+  const unparsable = (sel) => {
+    const s = String(sel)
+    return (s.match(/\[/g) || []).length !== (s.match(/\]/g) || []).length
+      || (s.match(/\(/g) || []).length !== (s.match(/\)/g) || []).length
+  }
+  return vm.createContext({
+    document: {
+      querySelectorAll(sel) {
+        counts.css++
+        if (unparsable(sel)) throw new SyntaxError(`Failed to execute 'querySelectorAll' on 'Document': '${sel}' is not a valid selector.`)
+        return []
+      },
+      evaluate(expr) {
+        counts.xpath++
+        if (unparsable(expr)) throw new SyntaxError(`Failed to execute 'evaluate': '${expr}' is not a valid XPath expression.`)
+        return { snapshotLength: 0, snapshotItem: () => null }
+      },
+    },
+    Node: { TEXT_NODE: 3 },
+    HTMLElement: class HTMLElement {},
+    Element: class Element {},
+    XPathResult: { ORDERED_NODE_SNAPSHOT_TYPE: 7 },
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+  })
+}
+
+/** Fake host that actually executes locate scripts (only those; nothing else). */
+function makeEvaluatingHost(context) {
+  return makeHost({
+    evaluate: async (_method, params) => {
+      const expr = String(params.expression || '')
+      // buildTargetScript is the only script this test wants to run.
+      if (!expr.includes('const spec =')) return { result: { value: { ok: true } } }
+      return { result: { value: await vm.runInContext(expr, context) } }
+    },
+  })
+}
+
+test('a selector that cannot parse fails at once instead of being polled to the deadline', async () => {
+  const counts = { css: 0, xpath: 0 }
+  const host = makeEvaluatingHost(makeLocateContext(counts))
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  const started = Date.now()
+  // A label or plain phrase passed where a selector belongs: `Learn more [` can
+  // never parse, so polling cannot help. It used to answer `return null` — the
+  // same as "not there yet" — and the caller burned the whole locate budget.
+  await assert.rejects(
+    () => p.click(sid, { target: { by: 'css', value: 'Learn more [' } }),
+    (error) => /invalid CSS selector/.test(String(error.message))
+      && /"Learn more \["/.test(String(error.message))
+      && /not a valid selector/.test(String(error.message)),
+  )
+  assert.equal(counts.css, 1, 'a selector that does not parse must not be retried')
+  assert.ok(Date.now() - started < 2_000, 'the parse error must be immediate, not the full budget')
+  assert.equal(host.events.press, 0, 'no mouse event may be dispatched for a failed locate')
+  await p.close(sid)
+})
+
+test('an unparsable XPath is named as such, once', async () => {
+  const counts = { css: 0, xpath: 0 }
+  const host = makeEvaluatingHost(makeLocateContext(counts))
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await assert.rejects(
+    () => p.click(sid, { target: { by: 'xpath', value: '//div[' } }),
+    (error) => /invalid XPath/.test(String(error.message)) && /not a valid XPath/.test(String(error.message)),
+  )
+  assert.equal(counts.css, 0, 'the xpath branch must not fall through to CSS')
+  assert.equal(counts.xpath, 1)
+  await p.close(sid)
+})
+
+test('a selector that is legal but finds nothing reports the miss with its own strategy', async () => {
+  const counts = { css: 0, xpath: 0 }
+  const host = makeEvaluatingHost(makeLocateContext(counts))
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  // `Learn more` IS a valid CSS descendant selector, so it is polled until the
+  // budget ends — but the verdict must say what was looked for, with the
+  // strategy the provider assumed, and must beat the outer generic timeout.
+  await assert.rejects(
+    () => p.setValue(sid, { target: { value: 'Learn more' }, value: 'x', timeoutMs: 200 }),
+    (error) => /element not found/.test(String(error.message))
+      && /"by":"css"/.test(String(error.message))
+      && /looked for 200ms/.test(String(error.message)),
+  )
+  assert.ok(counts.css >= 2, 'a legal selector must still poll until its budget')
   await p.close(sid)
 })

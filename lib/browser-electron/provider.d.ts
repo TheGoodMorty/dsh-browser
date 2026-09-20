@@ -361,6 +361,8 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
      * (polling until it appears or the budget runs out) and then runs `body`
      * with `el` in scope. Shared by the target-based tools: click/type (②),
      * setValue/check/select/clear/getValue (③), and the scrape item wait.
+     * A selector that fails to PARSE is reported immediately instead of being
+     * polled until the budget expires — see the comment in `match`.
      */
     private buildTargetScript;
     /**
