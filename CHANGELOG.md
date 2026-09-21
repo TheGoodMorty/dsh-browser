@@ -698,3 +698,46 @@ bump `0.1.21 → 0.1.22`,把此前未发版的全部修复随一个版本交付:
 README 中英同步:更新记录新增五行;`browser_download`/`browser_screenshot` 的 `savePath` 限制与 `downloadDir` 默认值(含本地化目录)说明对齐;崩溃自愈条目补上 `about:blank` 预加载、20s 命令超时与宿主日志路径。
 
 **验证**:`tsc` 构建零错误;`node --test tests/*.test.mjs` **35/35 全部通过**;`lib/` 由 `src/` 重新编译后与提交产物逐字节一致。
+
+---
+
+## 第十八轮(2026-09-20,Windows 真机三连:页面被判定不可见 / 首击丢失 / 首键丢失 + 探测自愈 + 定位失败可读性)
+
+本轮在真实 Windows 11 + Electron 44.0.0 自托管宿主(`dsh web` profile)上实测,缺陷 1–4 都是「CDP 报成功、页面什么都没收到」这一类:快照与脚本执行始终正常,只有输入无效,因此从工具输出完全看不出区别。缺陷 5 是修好之后照真实调用走一遍才撞出来的报错可读性问题。
+
+**缺陷 1 · 页面被 Windows 判定为「不可见」,整站停帧且所有合成输入被丢**
+
+- 根因:Chromium 在 Windows 上的 `CalculateNativeWinOcclusion` 特性会把被其他窗口遮挡的窗口置为 `Visibility::HIDDEN`。插件窗口长期排在人的窗口之后 → 页内 `visibilityState` 恒为 `"hidden"`、`requestAnimationFrame` 一帧都不发,而 `RenderWidgetHostImpl::CanReceiveInput()` 同时返回 false,于是每一条 `Input.dispatchMouseEvent` / `dispatchKeyEvent` 都被渲染端**静默丢弃**,CDP 依旧回 `{}`。
+- 修复:子进程在 `app.whenReady()` 之前追加 `disable-features=CalculateNativeWinOcclusion`(仅 `win32`,其他平台行为不变)。验证:窗口仍排在后序时 `visibilityState` 回到 `"visible"`、帧持续产出。
+
+**缺陷 2 · 新视图的第一次点击落空,第二次才生效**
+
+- 根因:`click()` 只发 `mousePressed` + `mouseReleased`,没有前置 `mouseMoved`。Chromium 对合成按下事件是按 widget 当前 hover 目标路由的(未先移动就会路由到旧位置/无目标),首次点击被丢。
+- 修复:改为 **move → press → release**(见 `provider.ts` 的 `send()` 辅助与 `CdpMouseParams`);新增回归测试断言派发序列严格为 `['mouseMoved','mousePressed','mouseReleased']`。
+- 顺带实测点击投递延迟:6 次采样,`click()` resolve 后效果立即可见(往返 6–110ms),因此**不加** settle 或重试步骤。
+
+**缺陷 3 · 键盘首键丢失(`browser_key` 第一次调用无效)**
+
+- 根因:新建的视图从未持有 web focus,`Input.dispatchKeyEvent` 无处投递,而 CDP 仍回 `{}`。页内 `document.hasFocus()` 两种情况都读 `true`,不能当信号用。
+- 修复:宿主新增 `focus` op(`webContents.focus()`,返回是否已聚焦),view handle 接口加可选 `focus?()`(DSH Desktop 宿主与既有测试替身不实现也照常编译),`provider.key()` 在派发前 best-effort 调用 `focusView()`。焦点落地是异步的:同一轮内紧随派发的键仍会被丢,所以**只在焦点确实需要移动时**等 `FOCUS_SETTLE_MS`(80ms)。窗口激活(`win.focus()`)试过,证明多余,已去掉以免抢前台。
+- 实测(真实宿主,进程内第一个视图、且键盘是该视图收到的第一个输入):修复前 `[]`,修复后 `["keydown:Escape","keyup:Escape"]`;冷 Escape / 冷 Enter / 先执行脚本再按键等四种组合全部落屏。
+
+**缺陷 4 · Electron 探测的「失败」被永久缓存,provider 再也无法自愈**
+
+- 根因:`available()` 把失败结果按宿主生命周期缓存,而 provider 选择每进程只发生一次。Electron 到位晚于 DSH 启动(懒下载、pnpm 拦下 postinstall 等)时,此后每次 browser 调用都报 `no usable browser provider is registered`,只能重启 DSH。
+- 修复:成功仍永久缓存;失败改为冷却窗口(默认 30s,可用 `DSH_BROWSER_PROBE_RETRY_MS` 调整)后重探,晚到的 Electron 自己就能被接上。`resolveProvider()` 的报错同时区分「一个 provider 都没注册」与「注册了但自报不可用」,后者附上可执行处置(`npx install-electron` / `ELECTRON_PATH`)。新增 `tests/electron-probe.test.mjs`:失败不重扫、窗口过后重探并成功、成功后不再扫(构造器第三参为探测 seam)。
+- 实测:插件目录布局下探测返回 `available=true`(profile 内 `electron@44.0.0` 带 `dist/electron.exe`)。
+
+**缺陷 5 · 定位失败被外层超时掩盖,报错说不出「查了什么」**
+
+- 根因(两条凑在一起):`buildTargetScript` 生成的页内脚本会把预算**轮询到底**才回答,而 `runTargetScript` 的外层超时用的是**同一个**预算 —— 两边同一刻到期,外层那句 `browser: click timed out after 10000ms` 抢先返回,页内已经写好的判词(哪个选择器、哪种策略没找到)永远发不出来。另一条:css/xpath **解析失败**(选择器根本不合法)被写成 `return null`,也就是「还没找到」,于是对着一个永远不可能变合法的选择器把预算轮完。
+- 修复:①解析失败即刻终止 —— 返回 `invalid CSS selector "…" (…)` / `invalid XPath …`,不再重试;②外层预算改为页内预算 + `TARGET_SCRIPT_GRACE_MS`(2s),让页内判词赶得上;③未命中判词补上提供方**实际采用的策略**(`by` 缺省即按 css,判词里就写 `"by":"css"`)与实际耗时;④`scrape` 的 item 选择器同样改成立刻失败并给同样的措辞。
+- 实测(真实宿主 + 本地页):同一个漏写 `by` 的调用,修复前 `browser: click timed out after 10000ms`;修复后 `browser: click failed: element not found: {"value":"Learn more","by":"css"} (looked for 10000ms)`;`div[` 这类不可解析选择器 **2ms** 返回 `invalid CSS selector "div[" (… is not a valid selector.)`。
+- 说明:**未**改成「页面加载完就只试一次」。合法选择器在 SPA 注水完成后才出现是常态,提前判死会伤掉真正的等待场景 —— 这里只把「说不清原因」修成「说清原因」,不缩短等待。
+- 新增 3 条单测跑在**真正执行**页内脚本的小 DOM(`node:vm` + 会解析选择器的 `querySelectorAll`)上:解析错误只试一次且一个鼠标事件都不派发、xpath 解析错误单独命名且不回落到 css、合法但不存在的选择器确实逐轮轮询并给出带策略的判词。
+
+**环境备注(未改代码)**:pnpm v10+ 默认不执行依赖 install 脚本,`electron` 的 postinstall(下载二进制)会被 `allowBuilds` 门拦下 —— 包在但 `dist/electron.exe` 不在,正是缺陷 4 的那类触发场景;`npx install-electron` 或放行构建即可。另外所有宿主实例共用一个 Chromium userData(`$DSH_HOME/dsh-builtin-browser-host`,代码注释本身也点了锁的问题),同时开多个宿主实例会在 profile/GPU cache 锁上互相争用,表现为偶发一次操作不生效、单独运行不复现;建议按宿主实例分目录,本轮未改。
+
+**验证**:`tsc -p tsconfig.json` 零错误;`node --test tests/*.test.mjs` **47/47 全绿**(新增 7 条:3 条键盘聚焦(次序 / 宿主无 `focus` / 聚焦抛错也不影响按键)+ 1 条探测冷却窗口 + 3 条定位判词);真实宿主端到端脚本 **17/17**(新增一步:从未被点击过的页面收到第一个键);真实宿主定位判词脚本 **4/4**(合法但不存在 / 解析错误即刻终止 / 文本目标仍可点击 / 判词抢先于外层超时)。
+
+**边界与状态**:未 bump 版本、未发布(发布时 bump)。缺陷 1 仅影响 Windows,缺陷 2/3/4 与平台无关,但 macOS / Linux 真机未复测。

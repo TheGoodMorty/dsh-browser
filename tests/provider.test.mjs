@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import vm from 'node:vm'
 
 import { ElectronBrowserProvider } from '../lib/browser-electron/provider.js'
 
@@ -16,13 +17,15 @@ function makeHost(overrides = {}) {
   const views = new Map()
   const showCalls = []
   const groupCalls = []
-  const events = { terminate: 0, release: 0, keyDown: 0, keyUp: 0, navigateHistory: 0, reload: 0, history: { entries: [], currentIndex: -1 }, insertText: '', keyDownParams: null }
+  const events = { terminate: 0, move: 0, press: 0, release: 0, keyDown: 0, keyUp: 0, focus: 0, order: [], navigateHistory: 0, reload: 0, history: { entries: [], currentIndex: -1 }, insertText: '', keyDownParams: null }
+  const mouseSequence = []
   const page = { url: 'about:blank', wait: { urlOk: true, loadedOk: true, foundOk: true } }
   let userActionHandler = null
   const host = {
     views,
     showCalls,
     groupCalls,
+    mouseSequence,
     events,
     page,
     createView() {
@@ -34,15 +37,17 @@ function makeHost(overrides = {}) {
           if (method === 'Page.navigate') { url = params.url; return {} }
           if (method === 'Page.reload') { events.reload++; return {} }
           if (method === 'Input.dispatchMouseEvent') {
-            if (params.type === 'mousePressed') return {}
+            mouseSequence.push(params.type)
+            if (params.type === 'mouseMoved') { events.move++; return {} }
+            if (params.type === 'mousePressed') { events.press++; return {} }
             events.release++
             if (events.release === 1 && overrides.failFirstRelease) throw new Error('release fails')
             return {}
           }
           if (method === 'Input.insertText') { events.insertText = params.text; return {} }
           if (method === 'Input.dispatchKeyEvent') {
-            if (params.type === 'keyDown') { events.keyDown++; events.keyDownParams = params }
-            if (params.type === 'keyUp') events.keyUp++
+            if (params.type === 'keyDown') { events.keyDown++; events.keyDownParams = params; events.order.push('keyDown') }
+            if (params.type === 'keyUp') { events.keyUp++; events.order.push('keyUp') }
             return {}
           }
           if (method === 'Page.getNavigationHistory') return { entries: events.history.entries, currentIndex: events.history.currentIndex }
@@ -62,6 +67,9 @@ function makeHost(overrides = {}) {
         },
         download: overrides.download ?? (async () => {}),
         ...(overrides.capture !== undefined ? { capture: overrides.capture } : {}),
+        // Keyboard input only reaches a page whose view holds web focus; a
+        // host that cannot focus a view at all omits the method (`noFocus`).
+        ...(overrides.noFocus ? {} : { focus: async () => { events.focus++; events.order.push('focus') } }),
       }
       views.set(id, handle)
       return handle
@@ -201,6 +209,20 @@ test('hung execute times out and interrupts the page', async () => {
   await p.close(sid)
 })
 
+test('click moves the pointer before pressing, so the first click lands', async () => {
+  // Chromium routes a synthesized mousePressed to the widget's current hover
+  // target instead of hit-testing it: without a preceding mouseMoved the press
+  // of the FIRST click on a fresh view is dropped by the renderer while CDP
+  // still reports success.
+  const host = makeHost()
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.click(sid, { x: 5, y: 5 })
+  assert.deepEqual(host.mouseSequence, ['mouseMoved', 'mousePressed', 'mouseReleased'])
+  assert.equal(host.events.move, 1)
+  await p.close(sid)
+})
+
 test('click retries release after a failure (no stuck button)', async () => {
   const host = makeHost({ failFirstRelease: true })
   const p = new ElectronBrowserProvider(host)
@@ -232,6 +254,40 @@ test('key Space carries CDP text so a focused input receives the character', asy
   // Enter has no printable text; the keyDown must not carry a stray text.
   await p.key(sid, { key: 'Enter' })
   assert.equal(host.events.keyDownParams.text, undefined)
+  await p.close(sid)
+})
+
+test('key focuses the view first, so the first key of a fresh session is not dropped', async () => {
+  const host = makeHost()
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.key(sid, { key: 'Enter' })
+  // A renderer drops injected keys unless the view holds web focus, so focus
+  // has to happen before the keyDown — not after, and not never.
+  assert.deepEqual(host.events.order, ['focus', 'keyDown', 'keyUp'])
+  assert.equal(host.events.focus, 1)
+  await p.close(sid)
+})
+
+test('key still dispatches when the host cannot focus a view', async () => {
+  const host = makeHost({ noFocus: true })
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await p.key(sid, { key: 'Escape' })
+  assert.equal(host.events.focus, 0)
+  assert.deepEqual(host.events.order, ['keyDown', 'keyUp'])
+  await p.close(sid)
+})
+
+test('key survives a view that refuses focus', async () => {
+  const host = makeHost()
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  const handle = [...host.views.values()][0]
+  handle.focus = async () => { throw new Error('focus denied') }
+  await p.key(sid, { key: 'Enter' })
+  assert.equal(host.events.keyDown, 1, 'a failed focus must not swallow the key')
+  assert.deepEqual(host.events.order, ['keyDown', 'keyUp'])
   await p.close(sid)
 })
 
@@ -486,5 +542,102 @@ test('scrape extracts items through static CSS fields', async () => {
   assert.equal(r.items[1].url, null)
   assert.match(lastExpr, /div\.card/)
   assert.match(lastExpr, /a@href/)
+  await p.close(sid)
+})
+
+/**
+ * A DOM small enough to RUN the provider's in-page locate script, parsing
+ * selectors the way Chromium does: unbalanced brackets are a SyntaxError,
+ * anything else is a legal query that simply finds nothing here.
+ */
+function makeLocateContext(counts) {
+  const unparsable = (sel) => {
+    const s = String(sel)
+    return (s.match(/\[/g) || []).length !== (s.match(/\]/g) || []).length
+      || (s.match(/\(/g) || []).length !== (s.match(/\)/g) || []).length
+  }
+  return vm.createContext({
+    document: {
+      querySelectorAll(sel) {
+        counts.css++
+        if (unparsable(sel)) throw new SyntaxError(`Failed to execute 'querySelectorAll' on 'Document': '${sel}' is not a valid selector.`)
+        return []
+      },
+      evaluate(expr) {
+        counts.xpath++
+        if (unparsable(expr)) throw new SyntaxError(`Failed to execute 'evaluate': '${expr}' is not a valid XPath expression.`)
+        return { snapshotLength: 0, snapshotItem: () => null }
+      },
+    },
+    Node: { TEXT_NODE: 3 },
+    HTMLElement: class HTMLElement {},
+    Element: class Element {},
+    XPathResult: { ORDERED_NODE_SNAPSHOT_TYPE: 7 },
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+  })
+}
+
+/** Fake host that actually executes locate scripts (only those; nothing else). */
+function makeEvaluatingHost(context) {
+  return makeHost({
+    evaluate: async (_method, params) => {
+      const expr = String(params.expression || '')
+      // buildTargetScript is the only script this test wants to run.
+      if (!expr.includes('const spec =')) return { result: { value: { ok: true } } }
+      return { result: { value: await vm.runInContext(expr, context) } }
+    },
+  })
+}
+
+test('a selector that cannot parse fails at once instead of being polled to the deadline', async () => {
+  const counts = { css: 0, xpath: 0 }
+  const host = makeEvaluatingHost(makeLocateContext(counts))
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  const started = Date.now()
+  // A label or plain phrase passed where a selector belongs: `Learn more [` can
+  // never parse, so polling cannot help. It used to answer `return null` — the
+  // same as "not there yet" — and the caller burned the whole locate budget.
+  await assert.rejects(
+    () => p.click(sid, { target: { by: 'css', value: 'Learn more [' } }),
+    (error) => /invalid CSS selector/.test(String(error.message))
+      && /"Learn more \["/.test(String(error.message))
+      && /not a valid selector/.test(String(error.message)),
+  )
+  assert.equal(counts.css, 1, 'a selector that does not parse must not be retried')
+  assert.ok(Date.now() - started < 2_000, 'the parse error must be immediate, not the full budget')
+  assert.equal(host.events.press, 0, 'no mouse event may be dispatched for a failed locate')
+  await p.close(sid)
+})
+
+test('an unparsable XPath is named as such, once', async () => {
+  const counts = { css: 0, xpath: 0 }
+  const host = makeEvaluatingHost(makeLocateContext(counts))
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  await assert.rejects(
+    () => p.click(sid, { target: { by: 'xpath', value: '//div[' } }),
+    (error) => /invalid XPath/.test(String(error.message)) && /not a valid XPath/.test(String(error.message)),
+  )
+  assert.equal(counts.css, 0, 'the xpath branch must not fall through to CSS')
+  assert.equal(counts.xpath, 1)
+  await p.close(sid)
+})
+
+test('a selector that is legal but finds nothing reports the miss with its own strategy', async () => {
+  const counts = { css: 0, xpath: 0 }
+  const host = makeEvaluatingHost(makeLocateContext(counts))
+  const p = new ElectronBrowserProvider(host)
+  const sid = await p.open()
+  // `Learn more` IS a valid CSS descendant selector, so it is polled until the
+  // budget ends — but the verdict must say what was looked for, with the
+  // strategy the provider assumed, and must beat the outer generic timeout.
+  await assert.rejects(
+    () => p.setValue(sid, { target: { value: 'Learn more' }, value: 'x', timeoutMs: 200 }),
+    (error) => /element not found/.test(String(error.message))
+      && /"by":"css"/.test(String(error.message))
+      && /looked for 200ms/.test(String(error.message)),
+  )
+  assert.ok(counts.css >= 2, 'a legal selector must still poll until its budget')
   await p.close(sid)
 })

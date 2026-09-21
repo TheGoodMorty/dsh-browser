@@ -207,6 +207,12 @@ export interface ElectronViewHandle {
    * @returns the CDP `result` object.
    */
   sendCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>
+  /**
+   * Give the backing view web focus so keyboard input reaches its page.
+   * Optional: an adapter that cannot focus a view omits it, and the provider
+   * then behaves exactly as before.
+   */
+  focus?(): Promise<void>
 }
 
 /** One tab inside a session: its view plus a stable id. */
@@ -254,14 +260,16 @@ export interface CdpNavigateParams {
 }
 
 /**
- * CDP method/params for `Input.dispatchMouseEvent` (a click press+release pair).
+ * CDP method/params for `Input.dispatchMouseEvent`: a pointer move, or one half
+ * of a click's press+release pair. `button`/`clickCount` belong to the press and
+ * release halves; a move carries only the position.
  */
 export interface CdpMouseParams {
-  readonly type: 'mousePressed' | 'mouseReleased'
+  readonly type: 'mouseMoved' | 'mousePressed' | 'mouseReleased'
   readonly x: number
   readonly y: number
-  readonly button: 'left'
-  readonly clickCount: number
+  readonly button?: 'left'
+  readonly clickCount?: number
 }
 
 /** CDP method/params for `Input.insertText`. */
@@ -661,6 +669,26 @@ export class ElectronBrowserProvider implements BrowserProvider {
         'BROWSER_VIEW_NOT_PRESENTED',
         { cause: error },
       )
+    }
+  }
+
+  /**
+   * Give the view web focus before synthesizing keyboard input.
+   *
+   * A renderer only delivers key events to the view that holds web focus. A
+   * view that was created but never clicked holds none — and `Input` events
+   * injected over CDP do not grant it — so the FIRST `browser_key` of a fresh
+   * session vanished inside the renderer while the command still answered
+   * success. Hosts that cannot focus a view (a test double, a different shell
+   * adapter) simply have no `focus`, and nothing changes for them.
+   */
+  private async focusView(handle: ElectronViewHandle): Promise<void> {
+    if (handle.focus === undefined) return
+    try {
+      await handle.focus()
+    } catch {
+      // Best-effort: a view that refuses focus must not fail the caller's key
+      // press; the dispatch below reports a real channel failure itself.
     }
   }
 
@@ -1196,23 +1224,51 @@ export class ElectronBrowserProvider implements BrowserProvider {
     // Input.* is only delivered to a view with a current display surface; the
     // barrier also re-presents after a navigation replaced the renderer.
     await this.present(s, signal)
-    const press = (type: 'mousePressed' | 'mouseReleased'): Promise<Record<string, unknown>> =>
-      handle.sendCommand('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 } satisfies CdpMouseParams)
     const timeoutMs = 30_000
+    const send = (params: Record<string, unknown>, label: string): Promise<unknown> =>
+      withTimeout(
+        handle.sendCommand('Input.dispatchMouseEvent', params),
+        timeoutMs,
+        signal,
+        `browser: click ${label} timed out after ${timeoutMs}ms`,
+      )
+    // Chromium routes a synthesized `mousePressed` to the widget's *current*
+    // hover target rather than hit-testing the coordinates, and a real pointer
+    // click is always preceded by movement. A view that has never received a
+    // mouse event has no hover target yet, so the press of the FIRST click on a
+    // fresh tab went nowhere while CDP still answered success; the second click
+    // landed because the first had quietly established the target. Move the
+    // pointer first so a click is self-contained.
     try {
-      await withTimeout(press('mousePressed'), timeoutMs, signal, `browser: click press timed out after ${timeoutMs}ms`)
+      await send({ type: 'mouseMoved', x, y } satisfies CdpMouseParams, 'move')
+    } catch (error) {
+      throw new BrowserError(`browser: click failed: ${String(error)}`, 'BROWSER_CLICK_FAILED', { cause: error })
+    }
+    const release = (): void => {
+      void handle
+        .sendCommand('Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x,
+          y,
+          button: 'left',
+          clickCount: 1,
+        } satisfies CdpMouseParams)
+        .catch(() => {})
+    }
+    try {
+      await send({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, 'press')
     } catch (error) {
       // The press may still land late; release best-effort so the button is
       // never left in a stuck pressed state.
-      void press('mouseReleased').catch(() => {})
+      release()
       throw new BrowserError(`browser: click failed: ${String(error)}`, 'BROWSER_CLICK_FAILED', { cause: error })
     }
     try {
-      await withTimeout(press('mouseReleased'), timeoutMs, signal, `browser: click release timed out after ${timeoutMs}ms`)
+      await send({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, 'release')
     } catch (error) {
       // The press already landed; retry the release so the button is not
       // left pressed before surfacing the failure.
-      void press('mouseReleased').catch(() => {})
+      release()
       throw new BrowserError(`browser: click failed: ${String(error)}`, 'BROWSER_CLICK_FAILED', { cause: error })
     }
     this.record(s, 'click', 'target' in request ? { target: request.target } : { x, y }, true)
@@ -1375,6 +1431,7 @@ export class ElectronBrowserProvider implements BrowserProvider {
     const timeoutMs = 15_000
     // Input.dispatchKeyEvent is subject to the same display-surface rule.
     await this.present(s, signal)
+    await this.focusView(handle)
     const release = (): Promise<Record<string, unknown>> =>
       handle.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', ...params })
     try {
@@ -1552,10 +1609,16 @@ export class ElectronBrowserProvider implements BrowserProvider {
    * (polling until it appears or the budget runs out) and then runs `body`
    * with `el` in scope. Shared by the target-based tools: click/type (②),
    * setValue/check/select/clear/getValue (③), and the scrape item wait.
+   * A selector that fails to PARSE is reported immediately instead of being
+   * polled until the budget expires — see the comment in `match`.
    */
   private buildTargetScript(spec: BrowserElementTarget, timeoutMs: number, body: string): string {
+    // `by` defaults to css in-page; report the strategy that WAS used, or a
+    // miss says only `{"value":"Learn more"}` and the caller cannot tell that a
+    // plain label was queried as a CSS selector.
+    const resolvedSpec = { ...spec, by: spec.by ?? 'css' }
     return `(async () => {
-      const spec = ${JSON.stringify(spec)}
+      const spec = ${JSON.stringify(resolvedSpec)}
       const timeoutMs = ${String(timeoutMs)}
       const sleep = ms => new Promise(r => setTimeout(r, ms))
       const isVisible = el => el instanceof HTMLElement && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0)
@@ -1567,7 +1630,13 @@ export class ElectronBrowserProvider implements BrowserProvider {
         const index = typeof spec.index === 'number' ? spec.index : 0
         let els = []
         if (by === 'css') {
-          try { els = Array.from(document.querySelectorAll(value)) } catch { return null }
+          // A selector that does not PARSE can never match on a later poll, so
+          // it must not look like a miss: the old "return null" kept the caller
+          // polling until the whole budget was gone, and "element not found
+          // after 10s" reads like a slow page while the real cause is a
+          // malformed selector (a label or plain text passed where one belongs).
+          try { els = Array.from(document.querySelectorAll(value)) }
+          catch (error) { throw new Error('invalid CSS selector ' + JSON.stringify(value) + ' (' + String((error && error.message) || error) + ')') }
         } else if (by === 'xpath') {
           try {
             const snap = document.evaluate(value, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null)
@@ -1575,7 +1644,7 @@ export class ElectronBrowserProvider implements BrowserProvider {
               const n = snap.snapshotItem(i)
               if (n instanceof Element) els.push(n)
             }
-          } catch { return null }
+          } catch (error) { throw new Error('invalid XPath ' + JSON.stringify(value) + ' (' + String((error && error.message) || error) + ')') }
         } else {
           const all = Array.from(document.querySelectorAll('body *'))
           const exact = all.filter(el => isVisible(el) && ownText(el) === value)
@@ -1589,9 +1658,10 @@ export class ElectronBrowserProvider implements BrowserProvider {
       const deadline = Date.now() + timeoutMs
       let el = null
       for (;;) {
-        el = match()
+        // Only a parse error escapes the poll: see the comment in match() above.
+        try { el = match() } catch (error) { return { ok: false, error: String((error && error.message) || error) } }
         if (el !== null) break
-        if (Date.now() >= deadline) return { ok: false, error: 'element not found: ' + JSON.stringify(spec) }
+        if (Date.now() >= deadline) return { ok: false, error: 'element not found: ' + JSON.stringify(spec) + ' (looked for ' + timeoutMs + 'ms)' }
         await sleep(100)
       }
       ${body}
@@ -1611,9 +1681,14 @@ export class ElectronBrowserProvider implements BrowserProvider {
     errorCode: string,
     errorLabel: string,
   ): Promise<Record<string, unknown>> {
+    // The script polls for its whole `timeoutMs` and only then answers, so an
+    // outer budget of the same size fires at the same instant and wins: the
+    // caller saw `click timed out after 10000ms` while the page had already
+    // decided WHY (selector not found / malformed). Give the answer a chance to
+    // get back before the generic timeout replaces it.
     const result = await withTimeout(
       handleSendEvaluate(tab.handle, script),
-      timeoutMs,
+      timeoutMs + TARGET_SCRIPT_GRACE_MS,
       signal,
       `${errorLabel} timed out after ${timeoutMs}ms`,
       () => terminatePage(tab.handle),
@@ -1813,7 +1888,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
       const deadline = Date.now() + timeoutMs
       let items = []
       for (;;) {
-        try { items = Array.from(document.querySelectorAll(itemSel)) } catch (e) { return { ok: false, error: String(e) } }
+        // Immediate, like match() above: an unparseable selector can never match.
+        try { items = Array.from(document.querySelectorAll(itemSel)) }
+        catch (error) { return { ok: false, error: 'invalid CSS selector ' + JSON.stringify(itemSel) + ' (' + String((error && error.message) || error) + ')' } }
         if (items.length > 0) break
         if (Date.now() >= deadline) return { ok: false, error: 'no elements matched: ' + itemSel }
         await sleep(100)
@@ -2294,6 +2371,13 @@ const SETTLE_GRACE_MS = 150
 
 /** Poll interval for the document-settle loop. */
 const SETTLE_POLL_MS = 25
+
+/**
+ * Extra time the transport gets over an in-page locate script's own budget: the
+ * script polls for `timeoutMs` and answers only afterwards, so the outer wait
+ * must outlast it or its generic timeout hides the in-page reason.
+ */
+const TARGET_SCRIPT_GRACE_MS = 2_000
 
 /** `tab:<uuid>` ↔ `<uuid>`: ids accept either form (see locateTab). */
 function stripTabPrefix(id: string): string {
